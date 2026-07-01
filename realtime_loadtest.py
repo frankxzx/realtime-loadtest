@@ -88,6 +88,13 @@ class RateLimitError(Exception):
         self.retry_after = retry_after
 
 
+# ─── 转写失败异常（非限流的 input_audio_transcription.failed）──────────────────
+class TranscriptionFailed(Exception):
+    def __init__(self, message: str, code: str = ""):
+        super().__init__(message)
+        self.code = code
+
+
 # ─── 结构化日志 ─────────────────────────────────────────────────────────────────
 _C = {
     "reset": "\033[0m", "gray": "\033[90m", "cyan": "\033[96m",
@@ -210,12 +217,14 @@ LOG = EventLog(verbose=False)
 class GlobalStats:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    total_requests:    int   = 0
-    success:           int   = 0
-    failed:            int   = 0
-    rate_limited_429:  int   = 0
-    connection_errors: int   = 0
-    input_tokens:      int   = 0
+    total_requests:      int   = 0
+    success:             int   = 0
+    failed:              int   = 0
+    rate_limited_429:    int   = 0
+    transcription_failed: int  = 0
+    timeouts:            int   = 0
+    connection_errors:   int   = 0
+    input_tokens:        int   = 0
     output_tokens:     int   = 0
     total_tokens:      int   = 0
 
@@ -314,6 +323,29 @@ class GlobalStats:
             self.errors.append(f"[B{b}#{s}] {reason[:120]}")
             self._mark_first_anomaly_unlocked("failure", reason, elapsed)
 
+    async def record_timeout(self, reason: str = "Timeout"):
+        async with self.lock:
+            elapsed = time.monotonic() - self.start_time
+            b, _, s, _ = _ctx()
+            self.total_requests += 1
+            self.failed += 1
+            self.timeouts += 1
+            self.req_timestamps.append(time.monotonic())
+            self.errors.append(f"[B{b}#{s} TIMEOUT] {reason[:100]}")
+            self._mark_first_anomaly_unlocked("timeout", reason, elapsed)
+
+    async def record_transcription_failure(self, message: str, code: str = ""):
+        async with self.lock:
+            elapsed = time.monotonic() - self.start_time
+            b, _, s, _ = _ctx()
+            self.total_requests += 1
+            self.failed += 1
+            self.transcription_failed += 1
+            self.req_timestamps.append(time.monotonic())
+            self.errors.append(f"[B{b}#{s} TRANSCRIBE_FAIL:{code}] {message[:100]}")
+            self._mark_first_anomaly_unlocked("transcription_failed",
+                                              f"[{code}] {message}", elapsed)
+
     async def record_connection_error(self, reason: str):
         async with self.lock:
             elapsed = time.monotonic() - self.start_time
@@ -371,6 +403,8 @@ class GlobalStats:
             "success_rate_pct":   ok_rate,
             "failed":             self.failed,
             "rate_limited_429":   self.rate_limited_429,
+            "transcription_failed": self.transcription_failed,
+            "timeouts":           self.timeouts,
             "connection_errors":  self.connection_errors,
             "input_tokens":       self.input_tokens,
             "output_tokens":      self.output_tokens,
@@ -497,6 +531,15 @@ async def _wait_response_done(ws, worker: str, timeout: float) -> tuple[int, int
         if t == "response.done":
             usage = evt.get("response", {}).get("usage", {})
             return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+        if t == "conversation.item.input_audio_transcription.failed":
+            # 音频对话里转写失败：429 直接抛出，其他仅告警不中断（补全仍可能完成）
+            err  = evt.get("error", {}) or {}
+            code = err.get("code", "") or err.get("type", "")
+            msg  = err.get("message", "") or json.dumps(evt)[:200]
+            if _is_rate_limit(code, msg):
+                LOG.rate_limit(worker, f"[transcription.failed {code}] {msg}")
+                raise RateLimitError(msg, code=code)
+            LOG.warn(worker, "transcription.failed(非致命)", f"[{code}] {msg}")
         if t == "error":
             _raise_ws_error(evt)
 
@@ -529,17 +572,31 @@ async def _wait_transcription_completed(ws, worker: str, timeout: float) -> tupl
                          json.dumps({k: v for k, v in evt.items() if k != "logprobs"})[:300])
             return in_tok, out_tok, evt.get("transcript", "")
         if t == "conversation.item.input_audio_transcription.failed":
-            err = evt.get("error", {})
-            _raise_ws_error({"error": err})
+            # 转写失败：429 限流也可能从这里返回，需分类
+            err  = evt.get("error", {}) or {}
+            code = err.get("code", "") or err.get("type", "")
+            msg  = err.get("message", "") or json.dumps(evt)[:200]
+            if _is_rate_limit(code, msg):
+                LOG.rate_limit(worker, f"[transcription.failed {code}] {msg}")
+                raise RateLimitError(msg, code=code)
+            LOG.error(worker, "transcription.failed", f"[{code}] {msg}")
+            raise TranscriptionFailed(msg, code=code)
         if t == "error":
             _raise_ws_error(evt)
+
+
+def _is_rate_limit(code, msg: str) -> bool:
+    c = str(code).lower()
+    m = (msg or "").lower()
+    return ("rate" in m or "429" in str(code) or "rate_limit" in c
+            or "too many requests" in m or "quota" in m or "exceeded" in m)
 
 
 def _raise_ws_error(evt: dict):
     err  = evt.get("error", {})
     code = err.get("code", "")
     msg  = err.get("message", str(evt))
-    if "rate" in msg.lower() or "429" in str(code) or "rate_limit" in str(code).lower():
+    if _is_rate_limit(code, msg):
         raise RateLimitError(msg, code=code)
     raise Exception(f"[{code}] {msg}")
 
@@ -613,7 +670,7 @@ async def run_text_session(
             await stats.record_failure(msg)
     except asyncio.TimeoutError as e:
         LOG.error(wid, "Timeout", str(e), e)
-        await stats.record_failure("Timeout")
+        await stats.record_timeout(str(e) or "Timeout")
     except Exception as e:
         LOG.error(wid, "Exception", str(e), e)
         await stats.record_connection_error(str(e))
@@ -682,7 +739,7 @@ async def run_audio_session(
             await stats.record_failure(msg)
     except asyncio.TimeoutError as e:
         LOG.error(wid, "Timeout", str(e), e)
-        await stats.record_failure("Timeout")
+        await stats.record_timeout(str(e) or "Timeout")
     except Exception as e:
         LOG.error(wid, "Exception", str(e), e)
         await stats.record_connection_error(str(e))
@@ -742,6 +799,9 @@ async def run_transcribe_session(
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
         await stats.record_rate_limit(str(e), e.code, e.retry_after)
+    except TranscriptionFailed as e:
+        LOG.error(wid, "transcription.failed", f"[{e.code}] {e}")
+        await stats.record_transcription_failure(str(e), e.code)
     except InvalidStatus as e:
         is_429, code, msg, retry_after = _parse_invalid_status(e)
         if is_429:
@@ -752,7 +812,7 @@ async def run_transcribe_session(
             await stats.record_failure(msg)
     except asyncio.TimeoutError as e:
         LOG.error(wid, "Timeout", str(e), e)
-        await stats.record_failure("Timeout")
+        await stats.record_timeout(str(e) or "Timeout")
     except Exception as e:
         LOG.error(wid, "Exception", str(e), e)
         await stats.record_connection_error(str(e))
@@ -1047,6 +1107,13 @@ h2{font-size:14px;color:#8b949e;margin-bottom:10px;font-weight:normal;text-trans
 .card.warn .value{color:#d29922}
 .card.danger .value{color:#f85149}
 .card.good .value{color:#56d364}
+/* ── 异常分类 chips ── */
+#anom-chips{display:flex;flex-wrap:wrap;gap:10px}
+.chip{background:#161b22;border:1px solid #30363d;border-radius:20px;padding:6px 14px;
+  display:flex;gap:8px;align-items:center}
+.chip .n{font-size:16px;font-weight:bold}
+.chip .lbl{color:#8b949e;font-size:12px}
+.chip.zero{opacity:.45}
 /* ── 图表 ── */
 #chart-wrap{position:relative;height:260px;margin-top:4px}
 #chart{width:100%;height:100%}
@@ -1093,6 +1160,11 @@ td.evt{width:220px;white-space:nowrap}
 <div class="section">
   <h2>关键指标</h2>
   <div id="cards"></div>
+</div>
+
+<div class="section" id="anom-section">
+  <h2>异常分类</h2>
+  <div id="anom-chips"></div>
 </div>
 
 <div class="section">
@@ -1204,6 +1276,29 @@ document.getElementById("cards").innerHTML = cards.map(c =>
     <div class="value">${c.value}</div>
     ${c.sub?`<div class="sub">${c.sub}</div>`:""}
   </div>`).join("");
+
+// ── 异常分类 chips ────────────────────────────────────────────────────────────
+const e429   = SUM.rate_limited_429 || 0;
+const eTrans = SUM.transcription_failed || 0;
+const eTimeout = SUM.timeouts || 0;
+const eConn  = SUM.connection_errors || 0;
+const eOther = Math.max(0, (SUM.failed||0) - e429 - eTrans - eTimeout);
+const chips = [
+  {lbl:"429 限流",       n:e429,    color:"#f85149"},
+  {lbl:"转写失败",       n:eTrans,  color:"#db6d28"},
+  {lbl:"超时",           n:eTimeout,color:"#d29922"},
+  {lbl:"连接错误",       n:eConn,   color:"#bc8cff"},
+  {lbl:"其他失败",       n:eOther,  color:"#8b949e"},
+];
+const anomTotal = e429+eTrans+eTimeout+eConn+eOther;
+document.getElementById("anom-chips").innerHTML = chips.map(c =>
+  `<div class="chip ${c.n?'':'zero'}">
+     <span class="n" style="color:${c.color}">${c.n}</span>
+     <span class="lbl">${c.lbl}</span>
+   </div>`).join("");
+if (anomTotal === 0)
+  document.getElementById("anom-chips").innerHTML =
+    '<div class="chip zero"><span class="lbl">全程无异常 ✓</span></div>';
 
 // ── 429 详情表 ────────────────────────────────────────────────────────────────
 if (RL.length > 0) {

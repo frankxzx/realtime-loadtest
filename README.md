@@ -66,6 +66,8 @@ python3 realtime_loadtest.py --mode transcribe \
 - `--language` 可选，留空自动检测
 - `whisper-1` 是按时长计费（无 token）；`gpt-realtime-whisper` 按 token 计费，报告 TPM 才有意义
 
+**异常分类**：转写被限流时，429 不一定走 WS 握手，常以 `conversation.item.input_audio_transcription.failed` 事件返回。脚本会把异常拆成 5 类并分别计数：**429 限流 / 转写失败 / 超时 / 连接错误 / 其他失败**。`.failed` 里带限流关键字的归 429，其余归「转写失败」。log 和 HTML 报告都会体现（HTML 有「异常分类」chips + 首次异常定位）。
+
 ### Ramp 模式（找限流临界点）
 
 ```bash
