@@ -62,7 +62,7 @@ python3 realtime_loadtest.py --mode transcribe \
   --concurrency 10 --duration 60 --html
 ```
 
-用 `session.type = "realtime"` + `output_modalities = []` 开一个**纯转写会话**，只命中 input audio transcription 模型（如 `gpt-realtime-whisper`），不产生任何输出模态、不触发 LLM 补全，因此报告里的 token / RPM 全部归属转写模型本身——用来确认转写模型的配额是否被真正吃满。
+用 `session.type = "realtime"` + `output_modalities = ["text"]` 开一个**纯转写会话**，靠不发 `response.create` 来避免任何 LLM 补全，只命中 input audio transcription 模型（如 `gpt-realtime-whisper`），因此报告里的 token / RPM 全部归属转写模型本身——用来确认转写模型的配额是否被真正吃满。（`output_modalities` 不能为空数组，API 要求至少含 `text` 或 `audio`）
 
 流程：`session.update(type=realtime, output_modalities=[])` → `input_audio_buffer.append` → `input_audio_buffer.commit`（触发转写）→ 等 `conversation.item.input_audio_transcription.completed`（取 `transcript` + `usage`）。
 

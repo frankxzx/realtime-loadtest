@@ -607,11 +607,12 @@ async def run_transcribe_session(
     transcribe_model: str, language: str = "", timeout: float = 45.0,
 ) -> None:
     """
-    纯转写会话：session.type="realtime" + output_modalities=[]，只命中 input
-    audio transcription 模型（gpt-realtime-whisper），不产生任何输出模态（不走
-    LLM 补全），从而干净地测量转写模型自己的 RPM/TPM。
+    纯转写会话：session.type="realtime" + output_modalities=["text"]，靠不发
+    response.create 来避免任何 LLM 补全，只命中 input audio transcription
+    模型（gpt-realtime-whisper），从而干净地测量转写模型自己的 RPM/TPM。
     连接走 realtime 部署，转写模型部署名放在 audio.input.transcription.model。
     turn_detection=None，手动 commit 触发转写。
+    (output_modalities 不能为空数组，API 要求至少含 text 或 audio)
     """
     wid = f"W{worker_id:02d}"
     t_start = time.monotonic()
@@ -630,7 +631,7 @@ async def run_transcribe_session(
                 "type": "session.update",
                 "session": {
                     "type": "realtime",
-                    "output_modalities": [],
+                    "output_modalities": ["text"],
                     "audio": {
                         "input": {
                             "format": {"type": "audio/pcm", "rate": 24000},
