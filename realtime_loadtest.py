@@ -32,8 +32,13 @@ import argparse
 import statistics
 import subprocess
 import tempfile
+import ssl
 from dataclasses import dataclass, field
 from collections import deque
+
+_SSL_CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 # ─── 配置 ──────────────────────────────────────────────────────────────────────
 ENDPOINT   = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
@@ -210,6 +215,7 @@ async def run_text_session(
             additional_headers=headers,
             open_timeout=10,
             close_timeout=5,
+            ssl=_SSL_CTX,
         ) as ws:
             # 等待 session.created
             await _wait_event(ws, "session.created", timeout=10)
@@ -272,6 +278,7 @@ async def run_audio_session(
             additional_headers=headers,
             open_timeout=10,
             close_timeout=5,
+            ssl=_SSL_CTX,
         ) as ws:
             await _wait_event(ws, "session.created", timeout=10)
 
