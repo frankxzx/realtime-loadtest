@@ -337,26 +337,39 @@ class GlobalStats:
         }
 
 
-# ─── 音频生成 ───────────────────────────────────────────────────────────────────
+# ─── 测试音频 ───────────────────────────────────────────────────────────────────
+# 固定使用仓库内自带的 hello_world.wav（真实 "Hello world" TTS，24kHz mono PCM16）。
+# 这样每次跑都是同一段确定音频、转写结果稳定，且不依赖 say/ffmpeg。
+_AUDIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hello_world.wav")
+
+
+def _read_wav_pcm(path: str) -> bytes:
+    """读 WAV，校验为 24kHz mono 16-bit，返回裸 PCM。"""
+    import wave
+    with wave.open(path, "rb") as w:
+        ch, sw, sr, n = (w.getnchannels(), w.getsampwidth(),
+                         w.getframerate(), w.getnframes())
+        if (ch, sw, sr) != (1, 2, 24000):
+            raise ValueError(f"WAV 需为 mono/16-bit/24kHz，实际 ch={ch} sw={sw} sr={sr}")
+        return w.readframes(n)
+
+
 def _generate_audio_via_say(text: str = "Hello world") -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as f:
-        aiff_path = f.name
-    pcm_path = aiff_path.replace(".aiff", ".pcm")
+    """用 macOS say 直接输出 24kHz PCM16 WAV（无需 ffmpeg），返回裸 PCM。"""
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        wav_path = f.name
     try:
-        subprocess.run(["say", text, "-o", aiff_path], check=True, capture_output=True)
         subprocess.run(
-            ["ffmpeg", "-y", "-i", aiff_path,
-             "-ar", "24000", "-ac", "1", "-f", "s16le", pcm_path],
+            ["say", text, "--data-format=LEI16@24000", "--file-format=WAVE",
+             "-o", wav_path],
             check=True, capture_output=True,
         )
-        with open(pcm_path, "rb") as f:
-            return f.read()
+        return _read_wav_pcm(wav_path)
     finally:
-        for p in (aiff_path, pcm_path):
-            try:
-                os.unlink(p)
-            except FileNotFoundError:
-                pass
+        try:
+            os.unlink(wav_path)
+        except FileNotFoundError:
+            pass
 
 
 def _generate_audio_fallback(duration_s: float = 1.5, sr: int = 24000) -> bytes:
@@ -368,13 +381,22 @@ def _generate_audio_fallback(duration_s: float = 1.5, sr: int = 24000) -> bytes:
 
 
 def _load_test_audio() -> str:
+    # 1) 优先用仓库内自带的固定 hello_world.wav
+    if os.path.exists(_AUDIO_FILE):
+        try:
+            pcm = _read_wav_pcm(_AUDIO_FILE)
+            print(f"[音频] 固定 hello_world.wav ({len(pcm) // 2 / 24000:.2f}s, 24kHz mono)")
+            return base64.b64encode(pcm).decode()
+        except Exception as e:
+            print(f"[音频] hello_world.wav 读取失败({e})，尝试 say 生成")
+    # 2) 本机 say 直出 PCM（无需 ffmpeg）
     try:
         pcm = _generate_audio_via_say("Hello world")
-        print(f"[音频] macOS say 生成 'Hello world' TTS ({len(pcm) // 2 / 24000:.2f}s)")
+        print(f"[音频] macOS say 生成 'Hello world' ({len(pcm) // 2 / 24000:.2f}s)")
+        return base64.b64encode(pcm).decode()
     except Exception as e:
-        print(f"[音频] say/ffmpeg 不可用({e})，回退到正弦波")
-        pcm = _generate_audio_fallback()
-    return base64.b64encode(pcm).decode()
+        print(f"[音频] say 不可用({e})，回退到 440Hz 正弦波（转写无意义，仅测链路）")
+        return base64.b64encode(_generate_audio_fallback()).decode()
 
 
 TEST_AUDIO_B64 = _load_test_audio()
