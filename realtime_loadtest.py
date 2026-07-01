@@ -426,12 +426,11 @@ async def run_text_session(
             await _ws_send(ws, wid, {
                 "type": "session.update",
                 "session": {
-                    "type": "realtime",           # Azure GA 必填
-                    "modalities": ["text"],        # 非 output_modalities
+                    "type": "realtime",
+                    "output_modalities": ["text"],
                     "instructions": "You are a minimal assistant. Reply as briefly as possible.",
-                    "temperature": 0.1,
+                    "temperature": 0.8,
                     "max_response_output_tokens": 20,
-                    "turn_detection": None,        # null = 禁用 VAD，手动触发
                 },
             })
             await _wait_event(ws, wid, "session.updated", timeout=10)
@@ -497,13 +496,17 @@ async def run_audio_session(
             await _ws_send(ws, wid, {
                 "type": "session.update",
                 "session": {
-                    "type": "realtime",           # Azure GA 必填
-                    "modalities": ["text"],        # 非 output_modalities
+                    "type": "realtime",
+                    "output_modalities": ["text"],
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "turn_detection": None,
+                        },
+                    },
                     "instructions": "Transcribe the audio and reply with one word.",
-                    "input_audio_format": "pcm16", # 平铺字段，非 audio.input.format
-                    "temperature": 0.1,
+                    "temperature": 0.8,
                     "max_response_output_tokens": 10,
-                    "turn_detection": None,        # null = 禁用 VAD，手动触发
                 },
             })
             await _wait_event(ws, wid, "session.updated", timeout=10)
