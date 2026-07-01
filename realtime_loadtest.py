@@ -482,8 +482,6 @@ async def run_audio_session(
     wid     = f"W{worker_id:02d}"
     url     = build_ws_url(deployment)
     t_start = time.monotonic()
-    # Azure GA: input_audio_transcription.model 用部署名而非 "whisper-1"
-    whisper_model = WHISPER_DEPLOYMENT or deployment
 
     try:
         async with websockets.connect(
@@ -508,7 +506,6 @@ async def run_audio_session(
                             "format": {"type": "audio/pcm", "rate": 24000},
                         },
                     },
-                    "input_audio_transcription": {"model": whisper_model},
                     "temperature": 0.1,
                     "max_response_output_tokens": 10,
                 },
