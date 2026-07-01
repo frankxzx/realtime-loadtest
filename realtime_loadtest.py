@@ -17,7 +17,6 @@ Azure OpenAI Realtime API 压测脚本 (GA)
 
 import asyncio
 import websockets
-import websockets.exceptions
 from websockets.exceptions import InvalidStatus
 import json
 import time
@@ -473,8 +472,6 @@ async def run_text_session(
                     "type": "realtime",
                     "output_modalities": ["text"],
                     "instructions": "You are a minimal assistant. Reply as briefly as possible.",
-                    "temperature": 0.8,
-                    "max_response_output_tokens": 20,
                 },
             })
             await _wait_event(ws, wid, "session.updated", timeout=10)
@@ -530,8 +527,6 @@ async def run_audio_session(
                 "session": {
                     "type": "realtime",
                     "instructions": "Transcribe the audio and reply with one word.",
-                    "temperature": 0.8,
-                    "max_response_output_tokens": 10,
                     "audio": {
                         "input": {
                             "format": {"type": "audio/pcm", "rate": 24000},
@@ -556,7 +551,6 @@ async def run_audio_session(
             })
             await _wait_event(ws, wid, "session.updated", timeout=10)
             await _ws_send(ws, wid, {"type": "input_audio_buffer.append", "audio": TEST_AUDIO_B64})
-            await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
             await _ws_send(ws, wid, {"type": "response.create"})
             input_tok, output_tok = await _wait_response_done(ws, wid, timeout=timeout)
             latency = time.monotonic() - t_start
