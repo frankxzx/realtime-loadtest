@@ -527,16 +527,29 @@ async def run_audio_session(
                 "type": "session.update",
                 "session": {
                     "type": "realtime",
-                    "output_modalities": ["text"],
-                    "audio": {
-                        "input": {
-                            "format": {"type": "audio/pcm", "rate": 24000},
-                            "turn_detection": None,
-                        },
-                    },
                     "instructions": "Transcribe the audio and reply with one word.",
                     "temperature": 0.8,
                     "max_response_output_tokens": 10,
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "noise_reduction": {"type": "far_field"},
+                            "transcription": {
+                                "model": WHISPER_DEPLOYMENT or "gpt-realtime-whisper",
+                            },
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "threshold": 0.7,
+                                "prefix_padding_ms": 200,
+                                "silence_duration_ms": 800,
+                                "create_response": False,
+                            },
+                        },
+                        "output": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "voice": "alloy",
+                        },
+                    },
                 },
             })
             await _wait_event(ws, wid, "session.updated", timeout=10)
