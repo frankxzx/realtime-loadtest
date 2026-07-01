@@ -1,1 +1,4 @@
 .env
+__pycache__/
+*.pyc
+realtime_report_*.html
