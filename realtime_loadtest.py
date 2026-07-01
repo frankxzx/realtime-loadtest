@@ -424,6 +424,30 @@ async def _wait_response_done(ws, worker: str, timeout: float) -> tuple[int, int
             _raise_ws_error(evt)
 
 
+async def _wait_transcription_completed(ws, worker: str, timeout: float) -> tuple[int, int, str]:
+    """等待 conversation.item.input_audio_transcription.completed，返回 (in_tok, out_tok, transcript)"""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError("等待 transcription.completed 超时")
+        raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        evt = json.loads(raw)
+        t = evt.get("type", "")
+        LOG.recv(worker, t, {k: v for k, v in evt.items() if k not in ("type", "delta")})
+        if t == "conversation.item.input_audio_transcription.completed":
+            usage = evt.get("usage", {}) or {}
+            in_tok  = usage.get("input_tokens", 0)
+            out_tok = usage.get("output_tokens", 0)
+            # whisper-1 是按时长计费(usage.type=="duration")，无 token，则记 0
+            return in_tok, out_tok, evt.get("transcript", "")
+        if t == "conversation.item.input_audio_transcription.failed":
+            err = evt.get("error", {})
+            _raise_ws_error({"error": err})
+        if t == "error":
+            _raise_ws_error(evt)
+
+
 def _raise_ws_error(evt: dict):
     err  = evt.get("error", {})
     code = err.get("code", "")
@@ -577,15 +601,86 @@ async def run_audio_session(
         await stats.record_connection_error(str(e))
 
 
+# ─── 单次会话：转写专用（input audio transcription 模型独立压测）─────────────────
+async def run_transcribe_session(
+    stats: GlobalStats, deployment: str, worker_id: int,
+    transcribe_model: str, language: str = "", timeout: float = 45.0,
+) -> None:
+    """
+    使用 session.type="transcription" 的纯转写会话，只命中 input audio
+    transcription 模型（gpt-realtime-whisper），不走对话补全链路，
+    从而干净地测量转写模型自己的 RPM/TPM。
+    连接仍走 realtime 部署，转写模型部署名放在 audio.input.transcription.model。
+    """
+    wid = f"W{worker_id:02d}"
+    t_start = time.monotonic()
+    transcription: dict = {"model": transcribe_model}
+    if language:
+        transcription["language"] = language
+    try:
+        async with websockets.connect(
+            build_ws_url(deployment),
+            additional_headers={"api-key": API_KEY},
+            open_timeout=10, close_timeout=5, ssl=_SSL_CTX,
+        ) as ws:
+            LOG.info(wid, "connected")
+            await _wait_event(ws, wid, "session.created", timeout=10)
+            await _ws_send(ws, wid, {
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "noise_reduction": {"type": "far_field"},
+                            "transcription": transcription,
+                            "turn_detection": None,
+                        },
+                    },
+                },
+            })
+            await _wait_event(ws, wid, "session.updated", timeout=10)
+            await _ws_send(ws, wid, {"type": "input_audio_buffer.append", "audio": TEST_AUDIO_B64})
+            await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
+            input_tok, output_tok, transcript = await _wait_transcription_completed(
+                ws, wid, timeout=timeout)
+            latency = time.monotonic() - t_start
+            LOG.success(wid, "transcription.completed",
+                        f'in={input_tok} out={output_tok} lat={latency:.2f}s "{transcript[:30]}"')
+            await stats.record_success(input_tok, output_tok, latency)
+
+    except RateLimitError as e:
+        LOG.rate_limit(wid, f"[{e.code}] {e}")
+        await stats.record_rate_limit(str(e), e.code, e.retry_after)
+    except InvalidStatus as e:
+        is_429, code, msg, retry_after = _parse_invalid_status(e)
+        if is_429:
+            LOG.rate_limit(wid, f"[{code}] {msg} retry_after={retry_after}")
+            await stats.record_rate_limit(msg, code, retry_after)
+        else:
+            LOG.error(wid, f"HTTP {e.response.status_code}", msg, e)
+            await stats.record_failure(msg)
+    except asyncio.TimeoutError as e:
+        LOG.error(wid, "Timeout", str(e), e)
+        await stats.record_failure("Timeout")
+    except Exception as e:
+        LOG.error(wid, "Exception", str(e), e)
+        await stats.record_connection_error(str(e))
+
+
 # ─── Worker 池 ──────────────────────────────────────────────────────────────────
 async def worker_loop(
     stats: GlobalStats, mode: str, deployment: str,
     stop_event: asyncio.Event, worker_id: int, request_interval: float = 0.0,
+    transcribe_model: str = "", language: str = "",
 ) -> None:
     idx = worker_id
     while not stop_event.is_set():
         if mode == "text":
             await run_text_session(stats, deployment, worker_id, idx)
+        elif mode == "transcribe":
+            await run_transcribe_session(stats, deployment, worker_id,
+                                         transcribe_model, language)
         else:
             await run_audio_session(stats, deployment, worker_id)
         idx += 1
@@ -627,17 +722,21 @@ async def monitor_loop(
 # ─── 主压测 ─────────────────────────────────────────────────────────────────────
 async def run_load_test(
     mode: str, deployment: str, concurrency: int, duration: float,
-    request_interval: float = 0.0,
+    request_interval: float = 0.0, transcribe_model: str = "", language: str = "",
 ) -> GlobalStats:
     print(f"\n{_C['bold']}[压测]{_C['reset']} "
           f"mode={mode} deployment={deployment} concurrency={concurrency} duration={duration}s")
     print(f"  endpoint: {build_ws_url(deployment)}")
+    if mode == "transcribe":
+        print(f"  transcription model: {transcribe_model}"
+              f"{f'  language={language}' if language else ''}")
 
     stats = GlobalStats()
     stop_event = asyncio.Event()
     workers = [
         asyncio.create_task(
-            worker_loop(stats, mode, deployment, stop_event, i, request_interval)
+            worker_loop(stats, mode, deployment, stop_event, i, request_interval,
+                        transcribe_model, language)
         )
         for i in range(concurrency)
     ]
@@ -655,6 +754,7 @@ async def run_load_test(
 async def run_ramp_test(
     mode: str, deployment: str,
     ramp_start: int, ramp_max: int, ramp_step: int, step_duration: float,
+    transcribe_model: str = "", language: str = "",
 ) -> tuple[list[dict], GlobalStats | None]:
     print(f"\n[Ramp] {ramp_start}→{ramp_max} 并发，每步 {step_duration}s")
     results = []
@@ -663,7 +763,8 @@ async def run_ramp_test(
 
     while concurrency <= ramp_max:
         print(f"\n{'='*50}\n>>> 并发: {concurrency}")
-        stats = await run_load_test(mode, deployment, concurrency, step_duration)
+        stats = await run_load_test(mode, deployment, concurrency, step_duration,
+                                    0.0, transcribe_model, language)
         last_stats = stats
         s = stats.summary()
         s["concurrency"] = concurrency
@@ -692,8 +793,14 @@ def parse_args() -> argparse.Namespace:
         description="Azure OpenAI Realtime API 压测工具 (GA)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--mode",        choices=["text", "audio"], default="text")
-    p.add_argument("--deployment",  default=DEPLOYMENT)
+    p.add_argument("--mode", choices=["text", "audio", "transcribe"], default="text",
+                   help="text=文本补全  audio=语音对话  transcribe=纯转写(独立测 whisper 配额)")
+    p.add_argument("--deployment",  default=DEPLOYMENT,
+                   help="realtime 部署名(WS连接用)；transcribe 模式也连它")
+    p.add_argument("--transcribe-model", default=WHISPER_DEPLOYMENT,
+                   help="转写模型部署名(仅 transcribe 模式)，默认 $WHISPER_DEPLOYMENT")
+    p.add_argument("--language",    default="",
+                   help="转写语言 ISO-639-1(如 en/zh)，留空自动检测(仅 transcribe 模式)")
     p.add_argument("--concurrency", type=int,   default=5)
     p.add_argument("--duration",    type=float, default=60.0)
     p.add_argument("--interval",    type=float, default=0.0)
@@ -727,6 +834,9 @@ def main() -> None:
     if not args.deployment:
         print("错误: 请设置 --deployment 或 REALTIME_DEPLOYMENT")
         sys.exit(1)
+    if args.mode == "transcribe" and not args.transcribe_model:
+        print("错误: transcribe 模式需要 --transcribe-model 或 WHISPER_DEPLOYMENT")
+        sys.exit(1)
 
     LOG = EventLog(verbose=args.verbose)
     test_start_utc = datetime.now(timezone.utc).isoformat()
@@ -744,6 +854,7 @@ def main() -> None:
                     args.mode, args.deployment,
                     args.ramp_start, args.ramp_max,
                     args.ramp_step, args.ramp_step_duration,
+                    args.transcribe_model, args.language,
                 )
             )
         else:
@@ -751,6 +862,7 @@ def main() -> None:
                 run_load_test(
                     args.mode, args.deployment,
                     args.concurrency, args.duration, args.interval,
+                    args.transcribe_model, args.language,
                 )
             )
             s = stats.summary()
@@ -771,6 +883,7 @@ def main() -> None:
                 "test_start_utc":  test_start_utc,
                 "endpoint":        ENDPOINT,
                 "deployment":      args.deployment,
+                "transcribe_model": args.transcribe_model if args.mode == "transcribe" else "",
                 "region":          args.region,
                 "mode":            args.mode,
                 "concurrency":     args.concurrency,
@@ -917,6 +1030,7 @@ const metaFields = [
   ["部署",     META.deployment],
   ["区域",     META.region || "—"],
   ["模式",     META.mode],
+  ...(META.transcribe_model ? [["转写模型", META.transcribe_model]] : []),
   ["并发",     META.concurrency],
   ["时长",     META.duration_s + "s"],
   ["期望TPM",  META.expected_tpm || "—"],
