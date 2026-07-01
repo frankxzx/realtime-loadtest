@@ -41,17 +41,25 @@ _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
 
 
-def _load_dotenv(path: str = ".env") -> None:
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-    except FileNotFoundError:
-        pass
+def _load_dotenv() -> None:
+    # 优先找脚本旁边的 .env，其次找当前目录
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        os.path.join(os.getcwd(), ".env"),
+    ]
+    for path in candidates:
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            print(f"[env] loaded {path}")
+            return
+        except FileNotFoundError:
+            continue
 
 
 _load_dotenv()
