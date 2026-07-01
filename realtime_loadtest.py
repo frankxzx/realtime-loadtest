@@ -17,6 +17,8 @@ Azure OpenAI Realtime API 压测脚本 (GA)
 
 import asyncio
 import websockets
+import websockets.exceptions
+from websockets.exceptions import InvalidStatus
 import json
 import time
 import base64
@@ -432,7 +434,7 @@ def _raise_ws_error(evt: dict):
     raise Exception(f"[{code}] {msg}")
 
 
-def _parse_invalid_status(e: websockets.exceptions.InvalidStatus) -> tuple[bool, str, str, str]:
+def _parse_invalid_status(e: InvalidStatus) -> tuple[bool, str, str, str]:
     """返回 (is_429, code, message, retry_after)"""
     is_429 = e.response.status_code == 429
     code = retry_after = message = ""
@@ -493,7 +495,7 @@ async def run_text_session(
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
         await stats.record_rate_limit(str(e), e.code, e.retry_after)
-    except websockets.exceptions.InvalidStatus as e:
+    except InvalidStatus as e:
         is_429, code, msg, retry_after = _parse_invalid_status(e)
         if is_429:
             LOG.rate_limit(wid, f"[{code}] {msg} retry_after={retry_after}")
@@ -565,7 +567,7 @@ async def run_audio_session(
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
         await stats.record_rate_limit(str(e), e.code, e.retry_after)
-    except websockets.exceptions.InvalidStatus as e:
+    except InvalidStatus as e:
         is_429, code, msg, retry_after = _parse_invalid_status(e)
         if is_429:
             LOG.rate_limit(wid, f"[{code}] {msg} retry_after={retry_after}")
