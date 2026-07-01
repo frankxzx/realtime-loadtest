@@ -62,9 +62,9 @@ python3 realtime_loadtest.py --mode transcribe \
   --concurrency 10 --duration 60 --html
 ```
 
-用 `session.type = "transcription"` 开一个**纯转写会话**，只命中 input audio transcription 模型（如 `gpt-realtime-whisper`），不触发任何 LLM 补全，因此报告里的 token / RPM 全部归属转写模型本身——用来确认转写模型的配额是否被真正吃满。
+用 `session.type = "realtime"` + `output_modalities = []` 开一个**纯转写会话**，只命中 input audio transcription 模型（如 `gpt-realtime-whisper`），不产生任何输出模态、不触发 LLM 补全，因此报告里的 token / RPM 全部归属转写模型本身——用来确认转写模型的配额是否被真正吃满。
 
-流程：`session.update(type=transcription)` → `input_audio_buffer.append` → `input_audio_buffer.commit`（触发转写）→ 等 `conversation.item.input_audio_transcription.completed`（取 `transcript` + `usage`）。
+流程：`session.update(type=realtime, output_modalities=[])` → `input_audio_buffer.append` → `input_audio_buffer.commit`（触发转写）→ 等 `conversation.item.input_audio_transcription.completed`（取 `transcript` + `usage`）。
 
 - WebSocket 仍连 **realtime 部署**（`--deployment`），转写模型部署名走 `--transcribe-model`（默认 `$WHISPER_DEPLOYMENT`）
 - `--language` 可选，留空自动检测
