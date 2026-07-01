@@ -66,7 +66,24 @@ python3 realtime_loadtest.py --mode transcribe \
 - `--language` 可选，留空自动检测
 - `whisper-1` 是按时长计费（无 token）；`gpt-realtime-whisper` 按 token 计费，报告 TPM 才有意义
 
-**异常分类**：转写被限流时，429 不一定走 WS 握手，常以 `conversation.item.input_audio_transcription.failed` 事件返回。脚本会把异常拆成 5 类并分别计数：**429 限流 / 转写失败 / 超时 / 连接错误 / 其他失败**。`.failed` 里带限流关键字的归 429，其余归「转写失败」。log 和 HTML 报告都会体现（HTML 有「异常分类」chips + 首次异常定位）。
+## 429 与所有异常来源（重要）
+
+Realtime API 是 WebSocket，**429 不是单一的 HTTP 报错**——取决于什么时候撞限流，会以不同形式出现（已对照 [Azure 官方文档](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio-websockets) 与 [OpenAI Realtime 规范](https://developers.openai.com/api/docs/guides/realtime) 核实）：
+
+| 来源 | 何时 | 形式 | 说明 |
+|---|---|---|---|
+| **HTTP 429（握手）** | 建立连接时 | WS upgrade 返回 429（非 101），`InvalidStatus` | 连接级限流：并发连接数/连接速率超限，可能带 `Retry-After` 头 |
+| **`error` 事件** | 会话中 | JSON 事件 `{"type":"error","error":{type,code,message,param,event_id}}` | 会话内报错，限流也可能走这里（非 HTTP） |
+| **`response.done` status=failed** | 生成响应时 | 事件里 `response.status="failed"` + `status_details.error` | 之前会被误当成成功，现已修复：按 `status_details` 分类 |
+| **`input_audio_transcription.failed`** | 转写时 | JSON 事件带 `error.code` | 限流走这里，或 `audio_unintelligible` 等真实转写失败 |
+| **`rate_limits.updated`** | 每次 response.done 后 | `{rate_limits:[{name,limit,remaining,reset_seconds}]}` | **Azure 主动上报的配额**——对峙金证据，直接看到官方声明的 limit/remaining |
+
+**脚本把异常拆成 6 类分别计数**：**429 限流 / 转写失败 / response失败 / 超时 / 连接错误 / 其他失败**。判定限流用关键字（rate / 429 / rate_limit / too many requests / quota / exceeded），`.failed`、`error`、`response.done` 里命中的都归 429。
+
+log 和 HTML 报告都会体现：
+- HTML「异常分类」chips（6 类计数）+ 首次异常定位（第几批第几个）
+- HTML「Azure 上报的配额」区：`rate_limits.updated` 里 Azure 声明的 limit / 最低 remaining / 每次采样明细 —— 这是证明「配额没给够/被提前限流」最硬的证据
+- `rate_limits.updated` 也会实时打印到控制台日志
 
 ### Ramp 模式（找限流临界点）
 

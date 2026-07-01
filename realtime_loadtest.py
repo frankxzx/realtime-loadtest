@@ -95,6 +95,14 @@ class TranscriptionFailed(Exception):
         self.code = code
 
 
+# ─── 响应失败异常（response.done 里 status=failed/incomplete，非限流）──────────
+class ResponseFailed(Exception):
+    def __init__(self, message: str, code: str = "", status: str = ""):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
 # ─── 结构化日志 ─────────────────────────────────────────────────────────────────
 _C = {
     "reset": "\033[0m", "gray": "\033[90m", "cyan": "\033[96m",
@@ -222,6 +230,7 @@ class GlobalStats:
     failed:              int   = 0
     rate_limited_429:    int   = 0
     transcription_failed: int  = 0
+    response_failed:     int   = 0
     timeouts:            int   = 0
     connection_errors:   int   = 0
     input_tokens:        int   = 0
@@ -241,6 +250,10 @@ class GlobalStats:
     first_429_tpm:      float | None = None
     rate_limit_details: list         = field(default_factory=list)
     timeseries:         list         = field(default_factory=list)  # [{elapsed,rpm,tpm,ok,e429}]
+
+    # Azure 主动上报的配额 (rate_limits.updated 事件)：对峙金证据
+    rate_limit_reports: list         = field(default_factory=list)  # [{elapsed,name,limit,remaining,reset_seconds}]
+    declared_limits:    dict         = field(default_factory=dict)  # name -> {limit,min_remaining}
 
     # 批次/序号（第几批第几个）
     batch_index:        int          = 1
@@ -346,6 +359,39 @@ class GlobalStats:
             self._mark_first_anomaly_unlocked("transcription_failed",
                                               f"[{code}] {message}", elapsed)
 
+    async def record_response_failure(self, message: str, code: str = "", status: str = ""):
+        async with self.lock:
+            elapsed = time.monotonic() - self.start_time
+            b, _, s, _ = _ctx()
+            self.total_requests += 1
+            self.failed += 1
+            self.response_failed += 1
+            self.req_timestamps.append(time.monotonic())
+            self.errors.append(f"[B{b}#{s} RESP_{status}:{code}] {message[:100]}")
+            self._mark_first_anomaly_unlocked("response_failed",
+                                              f"[{status}/{code}] {message}", elapsed)
+
+    async def record_rate_limits_updated(self, rate_limits: list):
+        """记录 Azure 主动上报的配额，供报告展示"""
+        async with self.lock:
+            elapsed = time.monotonic() - self.start_time
+            for rl in rate_limits:
+                name      = rl.get("name", "")
+                limit     = rl.get("limit")
+                remaining = rl.get("remaining")
+                self.rate_limit_reports.append({
+                    "elapsed":       round(elapsed, 1),
+                    "name":          name,
+                    "limit":         limit,
+                    "remaining":     remaining,
+                    "reset_seconds": rl.get("reset_seconds"),
+                })
+                d = self.declared_limits.setdefault(name, {"limit": limit, "min_remaining": remaining})
+                if limit is not None:
+                    d["limit"] = limit
+                if remaining is not None and (d["min_remaining"] is None or remaining < d["min_remaining"]):
+                    d["min_remaining"] = remaining
+
     async def record_connection_error(self, reason: str):
         async with self.lock:
             elapsed = time.monotonic() - self.start_time
@@ -404,8 +450,10 @@ class GlobalStats:
             "failed":             self.failed,
             "rate_limited_429":   self.rate_limited_429,
             "transcription_failed": self.transcription_failed,
+            "response_failed":    self.response_failed,
             "timeouts":           self.timeouts,
             "connection_errors":  self.connection_errors,
+            "declared_limits":    self.declared_limits,
             "input_tokens":       self.input_tokens,
             "output_tokens":      self.output_tokens,
             "total_tokens":       self.total_tokens,
@@ -518,7 +566,32 @@ async def _wait_event(ws, worker: str, event_type: str, timeout: float) -> dict:
             _raise_ws_error(evt)
 
 
-async def _wait_response_done(ws, worker: str, timeout: float) -> tuple[int, int]:
+async def _capture_rate_limits(stats, worker: str, evt: dict) -> None:
+    """rate_limits.updated：Azure 主动上报的配额(limit/remaining/reset)，对峙金证据"""
+    rls = evt.get("rate_limits", []) or []
+    if stats is not None:
+        await stats.record_rate_limits_updated(rls)
+    brief = "  ".join(
+        f"{r.get('name')}:{r.get('remaining')}/{r.get('limit')}(reset{r.get('reset_seconds')}s)"
+        for r in rls)
+    LOG.info(worker, "rate_limits.updated", brief)
+
+
+def _handle_transcription_failed(worker: str, evt: dict, fatal: bool):
+    """处理 input_audio_transcription.failed；限流抛 RateLimitError，其余按 fatal 决定"""
+    err  = evt.get("error", {}) or {}
+    code = err.get("code", "") or err.get("type", "")
+    msg  = err.get("message", "") or json.dumps(evt)[:200]
+    if _is_rate_limit(code, msg):
+        LOG.rate_limit(worker, f"[transcription.failed {code}] {msg}")
+        raise RateLimitError(msg, code=code)
+    if fatal:
+        LOG.error(worker, "transcription.failed", f"[{code}] {msg}")
+        raise TranscriptionFailed(msg, code=code)
+    LOG.warn(worker, "transcription.failed(非致命)", f"[{code}] {msg}")
+
+
+async def _wait_response_done(ws, worker: str, timeout: float, stats=None) -> tuple[int, int]:
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -529,22 +602,35 @@ async def _wait_response_done(ws, worker: str, timeout: float) -> tuple[int, int
         t = evt.get("type", "")
         LOG.recv(worker, t, {k: v for k, v in evt.items() if k not in ("type", "delta")})
         if t == "response.done":
-            usage = evt.get("response", {}).get("usage", {})
+            resp   = evt.get("response", {}) or {}
+            status = resp.get("status", "completed")
+            usage  = resp.get("usage", {}) or {}
+            if status == "failed":
+                # response 级失败：可能是限流/服务端错误/内容过滤
+                sd   = resp.get("status_details", {}) or {}
+                err  = sd.get("error", {}) or {}
+                code = err.get("code", "") or sd.get("reason", "") or status
+                msg  = err.get("message", "") or json.dumps(sd)[:200]
+                if _is_rate_limit(code, msg):
+                    LOG.rate_limit(worker, f"[response.failed {code}] {msg}")
+                    raise RateLimitError(msg, code=code)
+                LOG.error(worker, "response.failed", f"[{code}] {msg}")
+                raise ResponseFailed(msg, code=code, status=status)
+            if status in ("incomplete", "cancelled"):
+                # 非致命：hit max_tokens/被打断，仍拿到部分 token，计成功但告警
+                sd = resp.get("status_details", {}) or {}
+                LOG.warn(worker, f"response.{status}", json.dumps(sd)[:120])
             return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+        if t == "rate_limits.updated":
+            await _capture_rate_limits(stats, worker, evt)
         if t == "conversation.item.input_audio_transcription.failed":
-            # 音频对话里转写失败：429 直接抛出，其他仅告警不中断（补全仍可能完成）
-            err  = evt.get("error", {}) or {}
-            code = err.get("code", "") or err.get("type", "")
-            msg  = err.get("message", "") or json.dumps(evt)[:200]
-            if _is_rate_limit(code, msg):
-                LOG.rate_limit(worker, f"[transcription.failed {code}] {msg}")
-                raise RateLimitError(msg, code=code)
-            LOG.warn(worker, "transcription.failed(非致命)", f"[{code}] {msg}")
+            _handle_transcription_failed(worker, evt, fatal=False)  # 音频对话里非致命
         if t == "error":
             _raise_ws_error(evt)
 
 
-async def _wait_transcription_completed(ws, worker: str, timeout: float) -> tuple[int, int, str]:
+async def _wait_transcription_completed(ws, worker: str, timeout: float,
+                                        stats=None) -> tuple[int, int, str]:
     """等待 conversation.item.input_audio_transcription.completed，返回 (in_tok, out_tok, transcript)"""
     deadline = time.monotonic() + timeout
     while True:
@@ -555,6 +641,9 @@ async def _wait_transcription_completed(ws, worker: str, timeout: float) -> tupl
         evt = json.loads(raw)
         t = evt.get("type", "")
         LOG.recv(worker, t, {k: v for k, v in evt.items() if k not in ("type", "delta")})
+        if t == "rate_limits.updated":
+            await _capture_rate_limits(stats, worker, evt)
+            continue
         if t == "conversation.item.input_audio_transcription.completed":
             usage   = evt.get("usage", {}) or {}
             details = usage.get("input_token_details", {}) or {}
@@ -572,15 +661,7 @@ async def _wait_transcription_completed(ws, worker: str, timeout: float) -> tupl
                          json.dumps({k: v for k, v in evt.items() if k != "logprobs"})[:300])
             return in_tok, out_tok, evt.get("transcript", "")
         if t == "conversation.item.input_audio_transcription.failed":
-            # 转写失败：429 限流也可能从这里返回，需分类
-            err  = evt.get("error", {}) or {}
-            code = err.get("code", "") or err.get("type", "")
-            msg  = err.get("message", "") or json.dumps(evt)[:200]
-            if _is_rate_limit(code, msg):
-                LOG.rate_limit(worker, f"[transcription.failed {code}] {msg}")
-                raise RateLimitError(msg, code=code)
-            LOG.error(worker, "transcription.failed", f"[{code}] {msg}")
-            raise TranscriptionFailed(msg, code=code)
+            _handle_transcription_failed(worker, evt, fatal=True)  # 转写模式里是致命
         if t == "error":
             _raise_ws_error(evt)
 
@@ -651,7 +732,7 @@ async def run_text_session(
                 },
             })
             await _ws_send(ws, wid, {"type": "response.create"})
-            input_tok, output_tok = await _wait_response_done(ws, wid, timeout=timeout)
+            input_tok, output_tok = await _wait_response_done(ws, wid, timeout=timeout, stats=stats)
             latency = time.monotonic() - t_start
             LOG.success(wid, "response.done",
                         f"in={input_tok} out={output_tok} lat={latency:.2f}s")
@@ -660,6 +741,9 @@ async def run_text_session(
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
         await stats.record_rate_limit(str(e), e.code, e.retry_after)
+    except ResponseFailed as e:
+        LOG.error(wid, f"response.{e.status}", f"[{e.code}] {e}")
+        await stats.record_response_failure(str(e), e.code, e.status)
     except InvalidStatus as e:
         is_429, code, msg, retry_after = _parse_invalid_status(e)
         if is_429:
@@ -720,7 +804,7 @@ async def run_audio_session(
             await _wait_event(ws, wid, "session.updated", timeout=10)
             await _ws_send(ws, wid, {"type": "input_audio_buffer.append", "audio": TEST_AUDIO_B64})
             await _ws_send(ws, wid, {"type": "response.create"})
-            input_tok, output_tok = await _wait_response_done(ws, wid, timeout=timeout)
+            input_tok, output_tok = await _wait_response_done(ws, wid, timeout=timeout, stats=stats)
             latency = time.monotonic() - t_start
             LOG.success(wid, "response.done",
                         f"in={input_tok} out={output_tok} lat={latency:.2f}s")
@@ -729,6 +813,9 @@ async def run_audio_session(
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
         await stats.record_rate_limit(str(e), e.code, e.retry_after)
+    except ResponseFailed as e:
+        LOG.error(wid, f"response.{e.status}", f"[{e.code}] {e}")
+        await stats.record_response_failure(str(e), e.code, e.status)
     except InvalidStatus as e:
         is_429, code, msg, retry_after = _parse_invalid_status(e)
         if is_429:
@@ -790,7 +877,7 @@ async def run_transcribe_session(
             await _ws_send(ws, wid, {"type": "input_audio_buffer.append", "audio": TEST_AUDIO_B64})
             await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
             input_tok, output_tok, transcript = await _wait_transcription_completed(
-                ws, wid, timeout=timeout)
+                ws, wid, timeout=timeout, stats=stats)
             latency = time.monotonic() - t_start
             LOG.success(wid, "transcription.completed",
                         f'in={input_tok} out={output_tok} lat={latency:.2f}s "{transcript[:30]}"')
@@ -1071,6 +1158,7 @@ def main() -> None:
                 "expected_rpm":    args.expected_rpm,
                 "summary":         s,
                 "rate_limit_details": stats.rate_limit_details,
+                "rate_limit_reports": stats.rate_limit_reports,
                 "timeseries":      stats.timeseries,
                 "ramp_results":    ramp_results or [],
             }
@@ -1117,11 +1205,12 @@ h2{font-size:14px;color:#8b949e;margin-bottom:10px;font-weight:normal;text-trans
 /* ── 图表 ── */
 #chart-wrap{position:relative;height:260px;margin-top:4px}
 #chart{width:100%;height:100%}
-/* ── 429 表 ── */
-#rl-table{width:100%;border-collapse:collapse}
-#rl-table th,#rl-table td{padding:5px 10px;text-align:left;border-bottom:1px solid #21262d}
-#rl-table th{color:#8b949e;font-weight:normal;background:#161b22}
+/* ── 429 表 / rate_limits 表 ── */
+#rl-table,#rlr-table{width:100%;border-collapse:collapse}
+#rl-table th,#rl-table td,#rlr-table th,#rlr-table td{padding:5px 10px;text-align:left;border-bottom:1px solid #21262d}
+#rl-table th,#rlr-table th{color:#8b949e;font-weight:normal;background:#161b22}
 #rl-table td.t{color:#d29922}
+#declared-chips{display:flex;flex-wrap:wrap;gap:10px}
 /* ── 工具栏 ── */
 #toolbar{position:sticky;top:0;background:#161b22;padding:8px 12px;display:flex;gap:8px;
   flex-wrap:wrap;z-index:10;border-bottom:1px solid #30363d}
@@ -1165,6 +1254,17 @@ td.evt{width:220px;white-space:nowrap}
 <div class="section" id="anom-section">
   <h2>异常分类</h2>
   <div id="anom-chips"></div>
+</div>
+
+<div class="section" id="declared-section" style="display:none">
+  <h2>Azure 上报的配额 (rate_limits.updated 事件)</h2>
+  <div id="declared-chips"></div>
+  <table id="rlr-table" style="margin-top:10px">
+    <thead><tr>
+      <th>+时间(s)</th><th>名称</th><th>limit</th><th>remaining</th><th>reset(s)</th>
+    </tr></thead>
+    <tbody id="rlr-body"></tbody>
+  </table>
 </div>
 
 <div class="section">
@@ -1280,17 +1380,19 @@ document.getElementById("cards").innerHTML = cards.map(c =>
 // ── 异常分类 chips ────────────────────────────────────────────────────────────
 const e429   = SUM.rate_limited_429 || 0;
 const eTrans = SUM.transcription_failed || 0;
+const eResp  = SUM.response_failed || 0;
 const eTimeout = SUM.timeouts || 0;
 const eConn  = SUM.connection_errors || 0;
-const eOther = Math.max(0, (SUM.failed||0) - e429 - eTrans - eTimeout);
+const eOther = Math.max(0, (SUM.failed||0) - e429 - eTrans - eResp - eTimeout);
 const chips = [
   {lbl:"429 限流",       n:e429,    color:"#f85149"},
   {lbl:"转写失败",       n:eTrans,  color:"#db6d28"},
+  {lbl:"response失败",   n:eResp,   color:"#f0883e"},
   {lbl:"超时",           n:eTimeout,color:"#d29922"},
   {lbl:"连接错误",       n:eConn,   color:"#bc8cff"},
   {lbl:"其他失败",       n:eOther,  color:"#8b949e"},
 ];
-const anomTotal = e429+eTrans+eTimeout+eConn+eOther;
+const anomTotal = e429+eTrans+eResp+eTimeout+eConn+eOther;
 document.getElementById("anom-chips").innerHTML = chips.map(c =>
   `<div class="chip ${c.n?'':'zero'}">
      <span class="n" style="color:${c.color}">${c.n}</span>
@@ -1299,6 +1401,28 @@ document.getElementById("anom-chips").innerHTML = chips.map(c =>
 if (anomTotal === 0)
   document.getElementById("anom-chips").innerHTML =
     '<div class="chip zero"><span class="lbl">全程无异常 ✓</span></div>';
+
+// ── Azure 上报配额 (rate_limits.updated) ──────────────────────────────────────
+const RLR      = META.rate_limit_reports || [];
+const DECLARED = SUM.declared_limits || {};
+if (RLR.length > 0 || Object.keys(DECLARED).length > 0) {
+  document.getElementById("declared-section").style.display = "";
+  document.getElementById("declared-chips").innerHTML =
+    Object.entries(DECLARED).map(([name,d])=>
+      `<div class="chip">
+         <span class="lbl">${esc(name)} 上限</span>
+         <span class="n" style="color:#58a6ff">${d.limit!=null?d.limit.toLocaleString():"—"}</span>
+         <span class="lbl">最低剩余</span>
+         <span class="n" style="color:${d.min_remaining===0?'#f85149':'#56d364'}">${d.min_remaining!=null?d.min_remaining.toLocaleString():"—"}</span>
+       </div>`).join("");
+  document.getElementById("rlr-body").innerHTML = RLR.map(r=>
+    `<tr>
+       <td>+${r.elapsed}s</td><td>${esc(r.name)}</td>
+       <td>${r.limit!=null?r.limit.toLocaleString():"—"}</td>
+       <td style="color:${r.remaining===0?'#f85149':'#c9d1d9'}">${r.remaining!=null?r.remaining.toLocaleString():"—"}</td>
+       <td>${r.reset_seconds!=null?r.reset_seconds:"—"}</td>
+     </tr>`).join("");
+}
 
 // ── 429 详情表 ────────────────────────────────────────────────────────────────
 if (RL.length > 0) {
