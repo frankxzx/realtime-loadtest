@@ -436,10 +436,20 @@ async def _wait_transcription_completed(ws, worker: str, timeout: float) -> tupl
         t = evt.get("type", "")
         LOG.recv(worker, t, {k: v for k, v in evt.items() if k not in ("type", "delta")})
         if t == "conversation.item.input_audio_transcription.completed":
-            usage = evt.get("usage", {}) or {}
+            usage   = evt.get("usage", {}) or {}
+            details = usage.get("input_token_details", {}) or {}
             in_tok  = usage.get("input_tokens", 0)
             out_tok = usage.get("output_tokens", 0)
-            # whisper-1 是按时长计费(usage.type=="duration")，无 token，则记 0
+            # 兜底1: 顶层 input_tokens 缺失时，用 audio+text 明细求和
+            if not in_tok and details:
+                in_tok = details.get("audio_tokens", 0) + details.get("text_tokens", 0)
+            # 兜底2: 仍拿到 total 但拆不出，用 total 当 in
+            if not in_tok and usage.get("total_tokens"):
+                in_tok = usage["total_tokens"] - out_tok
+            # 诊断: usage 缺失/全 0 时把原始事件打出来（whisper-1 按时长计费则 usage.type=="duration"）
+            if not usage or (in_tok == 0 and out_tok == 0):
+                LOG.warn(worker, "transcription usage 缺失/为0",
+                         json.dumps({k: v for k, v in evt.items() if k != "logprobs"})[:300])
             return in_tok, out_tok, evt.get("transcript", "")
         if t == "conversation.item.input_audio_transcription.failed":
             err = evt.get("error", {})
