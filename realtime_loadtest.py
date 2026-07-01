@@ -40,7 +40,6 @@ ENDPOINT   = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 API_KEY    = os.environ.get("AZURE_OPENAI_API_KEY", "")
 DEPLOYMENT = os.environ.get("REALTIME_DEPLOYMENT", "gpt-realtime-1.5")
 WHISPER_DEPLOYMENT = os.environ.get("WHISPER_DEPLOYMENT", "")
-API_VERSION = "2024-12-17"
 
 # 压测用的短文本 prompt（控制 token 数量）
 TEXT_PROMPTS = [
@@ -188,8 +187,9 @@ TEST_AUDIO_B64 = _load_test_audio()
 
 # ─── WebSocket 单次会话 ─────────────────────────────────────────────────────────
 def build_ws_url(deployment: str) -> str:
+    # GA endpoint: /openai/v1/realtime?model=<deployment>
     ep = ENDPOINT.replace("https://", "wss://").replace("http://", "ws://")
-    return f"{ep}/openai/realtime?api-version={API_VERSION}&deployment={deployment}"
+    return f"{ep}/openai/v1/realtime?model={deployment}"
 
 
 async def run_text_session(

@@ -19,6 +19,16 @@ pip install websockets
 brew install ffmpeg
 ```
 
+## WebSocket 端点
+
+使用 GA（正式版）API：
+
+```
+wss://<resource>.openai.azure.com/openai/v1/realtime?model=<deployment>
+```
+
+> Preview 版（`/openai/realtime?api-version=...&deployment=...`）已于 2026-04-30 废弃。
+
 ## 快速开始
 
 ```bash
