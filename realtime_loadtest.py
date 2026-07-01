@@ -31,6 +31,7 @@ import subprocess
 import tempfile
 import ssl
 import traceback
+import contextvars
 from dataclasses import dataclass, field
 from collections import deque
 from datetime import datetime, timezone
@@ -95,6 +96,16 @@ _C = {
 }
 _T0 = time.monotonic()
 
+# ─── 批次/序号上下文（asyncio 每个 task 独立，日志深处也能取到「第几批第几个」）──
+_CTX_BATCH    = contextvars.ContextVar("batch",    default=0)   # 第几批(ramp 步)
+_CTX_BATCH_CC = contextvars.ContextVar("batch_cc", default=0)   # 该批并发数
+_CTX_SEQ      = contextvars.ContextVar("seq",      default=0)   # 批内第几个请求
+_CTX_WORKER   = contextvars.ContextVar("worker",   default="")  # worker 标识
+
+
+def _ctx() -> tuple[int, int, int, str]:
+    return _CTX_BATCH.get(), _CTX_BATCH_CC.get(), _CTX_SEQ.get(), _CTX_WORKER.get()
+
 
 class EventLog:
     def __init__(self, verbose: bool = False):
@@ -102,9 +113,13 @@ class EventLog:
         self.entries: list[dict] = []
 
     def _entry(self, level, worker, direction, event, detail="", error="") -> dict:
+        batch, cc, seq, _ = _ctx()
         e = {
             "elapsed":   round(time.monotonic() - _T0, 3),
             "ts":        datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "batch":     batch,
+            "batch_cc":  cc,
+            "seq":       seq,
             "level":     level,
             "worker":    worker,
             "direction": direction,
@@ -121,12 +136,14 @@ class EventLog:
         dc = {"→": _C["cyan"], "←": _C["green"], "✓": _C["green"] + _C["bold"],
               "✗": _C["red"], "⚡": _C["yellow"], "·": _C["gray"]}.get(e["direction"], "")
         ts  = f"{_C['gray']}{e['ts']}{_C['reset']}"
-        wid = f"{_C['dim']}[{e['worker']:>3}]{_C['reset']}"
+        bt  = f"{_C['cyan']}B{e['batch']}{_C['reset']}" if e["batch"] else "  "
+        sq  = f"#{e['seq']}" if e["seq"] else ""
+        wid = f"{_C['dim']}[{e['worker']:>3}{sq}]{_C['reset']}"
         d   = f"{dc}{e['direction']}{_C['reset']}"
         ev  = f"{lc}{e['event']:<28}{_C['reset']}"
         det = f"{_C['dim']}{e['detail']}{_C['reset']}" if e["detail"] else ""
         err = f" {_C['red']}{e['error']}{_C['reset']}" if e["error"] else ""
-        print(f"{ts} {wid} {d} {ev}{det}{err}")
+        print(f"{ts} {bt} {wid} {d} {ev}{det}{err}")
 
     def send(self, worker, event, payload=None):
         if not self.verbose:
@@ -216,7 +233,30 @@ class GlobalStats:
     rate_limit_details: list         = field(default_factory=list)
     timeseries:         list         = field(default_factory=list)  # [{elapsed,rpm,tpm,ok,e429}]
 
+    # 批次/序号（第几批第几个）
+    batch_index:        int          = 1
+    batch_concurrency:  int          = 0
+    seq:                int          = 0
+    first_anomaly:      dict | None  = None   # 本批首次异常 {batch,batch_cc,seq,worker,elapsed,kind,detail}
+
     start_time: float = field(default_factory=time.monotonic)
+
+    def next_seq(self) -> int:
+        # asyncio 单线程、调用与使用间无 await，无需加锁
+        self.seq += 1
+        return self.seq
+
+    def _mark_first_anomaly_unlocked(self, kind: str, detail: str, elapsed: float):
+        if self.first_anomaly is not None:
+            return
+        b, cc, s, w = _ctx()
+        self.first_anomaly = {
+            "batch":    b, "batch_cc": cc, "seq": s, "worker": w,
+            "elapsed":  round(elapsed, 1), "kind": kind, "detail": detail[:200],
+        }
+        print(f"\n{_C['red']}{_C['bold']}★★★ 首次异常 ★★★{_C['reset']} "
+              f"{_C['yellow']}第 {b} 批(并发 {cc}) · 第 {s} 个请求 · {w}{_C['reset']} "
+              f"[{kind}] @ +{elapsed:.1f}s  {detail[:80]}\n")
 
     async def record_success(self, input_tok: int, output_tok: int, latency: float):
         async with self.lock:
@@ -242,6 +282,7 @@ class GlobalStats:
 
             rpm = self._rpm_unlocked()
             tpm = self._tpm_unlocked()
+            b, cc, s, w = _ctx()
 
             if self.first_429_elapsed is None:
                 self.first_429_elapsed = round(elapsed, 1)
@@ -250,25 +291,36 @@ class GlobalStats:
 
             self.rate_limit_details.append({
                 "elapsed":     round(elapsed, 1),
+                "batch":       b,
+                "batch_cc":    cc,
+                "seq":         s,
+                "worker":      w,
                 "code":        code,
                 "message":     message[:300],
                 "retry_after": retry_after,
                 "rpm":         rpm,
                 "tpm":         tpm,
             })
-            self.errors.append(f"[429:{code}] {message[:100]}")
+            self.errors.append(f"[B{b}#{s} 429:{code}] {message[:100]}")
+            self._mark_first_anomaly_unlocked("429", f"[{code}] {message}", elapsed)
 
     async def record_failure(self, reason: str):
         async with self.lock:
+            elapsed = time.monotonic() - self.start_time
+            b, _, s, _ = _ctx()
             self.total_requests += 1
             self.failed += 1
             self.req_timestamps.append(time.monotonic())
-            self.errors.append(reason[:120])
+            self.errors.append(f"[B{b}#{s}] {reason[:120]}")
+            self._mark_first_anomaly_unlocked("failure", reason, elapsed)
 
     async def record_connection_error(self, reason: str):
         async with self.lock:
+            elapsed = time.monotonic() - self.start_time
+            b, _, s, _ = _ctx()
             self.connection_errors += 1
-            self.errors.append(f"[CONN] {reason[:100]}")
+            self.errors.append(f"[B{b}#{s} CONN] {reason[:100]}")
+            self._mark_first_anomaly_unlocked("conn_error", reason, elapsed)
 
     def _rpm_unlocked(self) -> float:
         now = time.monotonic()
@@ -330,6 +382,9 @@ class GlobalStats:
             "first_429_elapsed_s": self.first_429_elapsed,
             "first_429_rpm":      self.first_429_rpm,
             "first_429_tpm":      self.first_429_tpm,
+            "first_anomaly":      self.first_anomaly,
+            "batch_index":        self.batch_index,
+            "batch_concurrency":  self.batch_concurrency,
             "latency_p50_ms":     round(statistics.median(lats) * 1000, 1) if lats else 0,
             "latency_p95_ms":     round(sorted(lats)[int(len(lats) * 0.95)] * 1000, 1) if lats else 0,
             "latency_p99_ms":     round(sorted(lats)[int(len(lats) * 0.99)] * 1000, 1) if lats else 0,
@@ -709,8 +764,13 @@ async def worker_loop(
     stop_event: asyncio.Event, worker_id: int, request_interval: float = 0.0,
     transcribe_model: str = "", language: str = "",
 ) -> None:
+    # 每个 worker 是独立 task，contextvars 互不干扰
+    _CTX_BATCH.set(stats.batch_index)
+    _CTX_BATCH_CC.set(stats.batch_concurrency)
+    _CTX_WORKER.set(f"W{worker_id:02d}")
     idx = worker_id
     while not stop_event.is_set():
+        _CTX_SEQ.set(stats.next_seq())   # 批内第几个请求（全 worker 共享递增）
         if mode == "text":
             await run_text_session(stats, deployment, worker_id, idx)
         elif mode == "transcribe":
@@ -758,15 +818,19 @@ async def monitor_loop(
 async def run_load_test(
     mode: str, deployment: str, concurrency: int, duration: float,
     request_interval: float = 0.0, transcribe_model: str = "", language: str = "",
+    batch_index: int = 1,
 ) -> GlobalStats:
     print(f"\n{_C['bold']}[压测]{_C['reset']} "
-          f"mode={mode} deployment={deployment} concurrency={concurrency} duration={duration}s")
+          f"第{batch_index}批 mode={mode} deployment={deployment} "
+          f"concurrency={concurrency} duration={duration}s")
     print(f"  endpoint: {build_ws_url(deployment)}")
     if mode == "transcribe":
         print(f"  transcription model: {transcribe_model}"
               f"{f'  language={language}' if language else ''}")
 
     stats = GlobalStats()
+    stats.batch_index = batch_index
+    stats.batch_concurrency = concurrency
     stop_event = asyncio.Event()
     workers = [
         asyncio.create_task(
@@ -795,14 +859,17 @@ async def run_ramp_test(
     results = []
     last_stats = None
     concurrency = ramp_start
+    batch_no = 0
 
     while concurrency <= ramp_max:
-        print(f"\n{'='*50}\n>>> 并发: {concurrency}")
+        batch_no += 1
+        print(f"\n{'='*50}\n>>> 第 {batch_no} 批  并发: {concurrency}")
         stats = await run_load_test(mode, deployment, concurrency, step_duration,
-                                    0.0, transcribe_model, language)
+                                    0.0, transcribe_model, language, batch_index=batch_no)
         last_stats = stats
         s = stats.summary()
         s["concurrency"] = concurrency
+        s["batch"] = batch_no
         results.append(s)
         print(f"  RPM={s['avg_rpm']}  TPM={s['avg_tpm']}  "
               f"429s={s['rate_limited_429']}  P95={s['latency_p95_ms']}ms")
@@ -813,12 +880,25 @@ async def run_ramp_test(
             break
         concurrency += ramp_step
 
-    print(f"\n{'='*60}\nRamp 汇总:")
-    print(f"{'并发':>6}  {'RPM':>8}  {'TPM':>9}  {'429':>6}  {'P95ms':>8}")
+    print(f"\n{'='*70}\nRamp 汇总:")
+    print(f"{'批':>3}  {'并发':>5}  {'RPM':>8}  {'TPM':>9}  {'429':>5}  "
+          f"{'P95ms':>8}  {'首次异常':>10}")
     for r in results:
+        fa = r.get("first_anomaly")
+        anom = f"第{fa['seq']}个/{fa['kind']}" if fa else "—"
         mark = f" {_C['yellow']}<-- 限流{_C['reset']}" if r["rate_limited_429"] > 0 else ""
-        print(f"{r['concurrency']:>6}  {r['avg_rpm']:>8.1f}  {r['avg_tpm']:>9.1f}  "
-              f"{r['rate_limited_429']:>6}  {r['latency_p95_ms']:>8.1f}{mark}")
+        print(f"{r.get('batch','?'):>3}  {r['concurrency']:>5}  {r['avg_rpm']:>8.1f}  "
+              f"{r['avg_tpm']:>9.1f}  {r['rate_limited_429']:>5}  "
+              f"{r['latency_p95_ms']:>8.1f}  {anom:>10}{mark}")
+
+    # 找到全局首次异常所在批次
+    for r in results:
+        fa = r.get("first_anomaly")
+        if fa:
+            print(f"\n{_C['yellow']}{_C['bold']}⚑ 首次异常出现在 第 {fa['batch']} 批"
+                  f"(并发 {fa['batch_cc']}) 第 {fa['seq']} 个请求 · {fa['worker']} · "
+                  f"{fa['kind']} @ +{fa['elapsed']}s{_C['reset']}")
+            break
     return results, last_stats
 
 
@@ -904,6 +984,10 @@ def main() -> None:
             print(f"\n{'='*60}\n{_C['bold']}最终统计:{_C['reset']}")
             for k, v in s.items():
                 print(f"  {k:<26}: {v}")
+            fa = stats.first_anomaly
+            if fa:
+                print(f"\n{_C['yellow']}{_C['bold']}⚑ 首次异常: 第 {fa['seq']} 个请求"
+                      f" · {fa['worker']} · {fa['kind']} @ +{fa['elapsed']}s{_C['reset']}")
             if stats.errors:
                 print(f"\n{_C['red']}错误样本 (最近10条):{_C['reset']}")
                 for e in stats.errors[-10:]:
@@ -989,13 +1073,18 @@ table.log tr:hover{background:#161b22}
 table.log td{padding:3px 8px;border-bottom:1px solid #21262d;vertical-align:top}
 .ts{color:#8b949e;white-space:nowrap}
 .wid{color:#79c0ff;white-space:nowrap}
+.bt{color:#58a6ff;white-space:nowrap}
+.sq{color:#d29922;white-space:nowrap}
 .dir{text-align:center}
 .s{color:#56d364}.r{color:#58a6ff}.ok{color:#56d364;font-weight:bold}
 .er{color:#f85149}.rl{color:#d29922}.i{color:#8b949e}
 .lvl-INFO{color:#c9d1d9}.lvl-WARN{color:#d29922}.lvl-ERROR{color:#f85149}.lvl-DEBUG{color:#6e7681}
+tr.first-anom{background:#3d1a1a !important;outline:1px solid #f85149}
+tr.first-anom td.evt{color:#ff7b72;font-weight:bold}
 .detail{color:#8b949e;word-break:break-all}
 .errstr{color:#f85149}
-td.dir{width:20px}td.ts{width:110px}td.wid{width:50px}td.evt{width:220px;white-space:nowrap}
+td.dir{width:20px}td.ts{width:96px}td.wid{width:50px}td.bt{width:34px}td.sq{width:44px}
+td.evt{width:220px;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -1015,7 +1104,8 @@ td.dir{width:20px}td.ts{width:110px}td.wid{width:50px}td.evt{width:220px;white-s
   <h2>429 限流详情</h2>
   <table id="rl-table">
     <thead><tr>
-      <th>+时间(s)</th><th>RPM@事件</th><th>TPM@事件</th>
+      <th>+时间(s)</th><th>批</th><th>#序号</th><th>Worker</th>
+      <th>RPM@事件</th><th>TPM@事件</th>
       <th>错误码</th><th>Retry-After</th><th>错误信息</th>
     </tr></thead>
     <tbody id="rl-body"></tbody>
@@ -1030,6 +1120,7 @@ td.dir{width:20px}td.ts{width:110px}td.wid{width:50px}td.evt{width:220px;white-s
       <option value="">全部级别</option>
       <option>INFO</option><option>WARN</option><option>ERROR</option><option>DEBUG</option>
     </select>
+    <select id="fBatch" onchange="renderLog()"></select>
     <select id="fWorker" onchange="renderLog()"></select>
     <select id="fDir" onchange="renderLog()">
       <option value="">全部方向</option>
@@ -1037,12 +1128,15 @@ td.dir{width:20px}td.ts{width:110px}td.wid{width:50px}td.evt{width:220px;white-s
       <option value="✓">✓ 成功</option><option value="✗">✗ 错误</option>
       <option value="⚡">⚡ 限流</option>
     </select>
+    <label style="align-self:center;color:#8b949e">
+      <input type="checkbox" id="fAnomaly" onchange="renderLog()"> 仅异常
+    </label>
     <span id="count"></span>
     <button id="export-btn" onclick="exportCSV()">⬇ 导出 CSV</button>
   </div>
   <table class="log">
     <thead><tr>
-      <th>时间</th><th>+秒</th><th>Worker</th><th>方向</th>
+      <th>时间</th><th>+秒</th><th>批</th><th>#</th><th>Worker</th><th>方向</th>
       <th>事件</th><th>详情</th><th>错误</th>
     </tr></thead>
     <tbody id="tbody"></tbody>
@@ -1082,6 +1176,9 @@ const peak_rpm  = SUM.peak_rpm || 0;
 const peak_tpm  = SUM.peak_tpm || 0;
 const ok_rate   = SUM.success_rate_pct || 0;
 const f429      = SUM.first_429_elapsed_s;
+const FA        = SUM.first_anomaly;   // {batch,batch_cc,seq,worker,elapsed,kind}
+const faText    = FA ? `第${FA.batch}批(并发${FA.batch_cc}) 第${FA.seq}个 · ${FA.worker}` : "—";
+const faSub     = FA ? `${FA.kind} @ +${FA.elapsed}s` : "全程无异常";
 
 function quotaLine(peak, quota, unit) {
   if (!quota) return "";
@@ -1096,6 +1193,7 @@ const cards = [
   {label:"峰值 RPM",   value: peak_rpm.toLocaleString(),               sub: quotaLine(peak_rpm, quota_rpm, "RPM"),    cls: quota_rpm&&peak_rpm<quota_rpm*0.7?"danger":""},
   {label:"峰值 TPM",   value: peak_tpm.toLocaleString(),               sub: quotaLine(peak_tpm, quota_tpm, "TPM"),    cls: quota_tpm&&peak_tpm<quota_tpm*0.7?"danger":""},
   {label:"429 次数",   value: (SUM.rate_limited_429||0).toLocaleString(), sub: f429!=null?`首次 +${f429}s`:"未触发", cls: SUM.rate_limited_429>0?"danger":"good"},
+  {label:"首次异常(第几批第几个)", value: faText,                        sub: faSub,  cls: FA?"danger":"good"},
   {label:"首次限流时",  value: f429!=null?"+"+f429+"s":"—",            sub: f429!=null?`RPM=${SUM.first_429_rpm} TPM=${SUM.first_429_tpm}`:"",  cls: f429!=null?"danger":""},
   {label:"P95 延迟",   value: (SUM.latency_p95_ms||0)+"ms",           sub:`P99=${SUM.latency_p99_ms||0}ms Max=${SUM.latency_max_ms||0}ms`, cls:""},
   {label:"总 Token",   value: (SUM.total_tokens||0).toLocaleString(),  sub:`in=${(SUM.input_tokens||0).toLocaleString()} out=${(SUM.output_tokens||0).toLocaleString()}`, cls:""},
@@ -1113,6 +1211,9 @@ if (RL.length > 0) {
   document.getElementById("rl-body").innerHTML = RL.map(r =>
     `<tr>
       <td class="t">+${r.elapsed}s</td>
+      <td style="color:#58a6ff">B${r.batch||"?"}</td>
+      <td style="color:#d29922">#${r.seq||"?"}</td>
+      <td>${esc(r.worker||"—")}</td>
       <td>${r.rpm}</td><td>${r.tpm}</td>
       <td style="color:#f85149">${esc(r.code)}</td>
       <td>${esc(r.retry_after||"—")}</td>
@@ -1229,42 +1330,64 @@ const wSel = document.getElementById("fWorker");
 wSel.innerHTML = '<option value="">全部 Worker</option>' +
   workers.map(w=>`<option>${w}</option>`).join("");
 
+const batches = [...new Set(ROWS.map(r=>r.batch))].sort((a,b)=>a-b);
+const bSel = document.getElementById("fBatch");
+bSel.innerHTML = '<option value="">全部批次</option>' +
+  batches.map(b=>`<option value="${b}">第 ${b} 批</option>`).join("");
+
+// 首次异常行标记（batch+seq+worker 定位）
+const isAnomalyRow = r => r.direction==="⚡" || r.direction==="✗" || r.level==="ERROR";
+
 const DIR_CLASS = {"→":"s","←":"r","✓":"ok","✗":"er","⚡":"rl","·":"i"};
 function renderLog(){
-  const q   = document.getElementById("search").value.toLowerCase();
-  const lvl = document.getElementById("fLevel").value;
-  const wid = document.getElementById("fWorker").value;
-  const dir = document.getElementById("fDir").value;
+  const q       = document.getElementById("search").value.toLowerCase();
+  const lvl     = document.getElementById("fLevel").value;
+  const wid     = document.getElementById("fWorker").value;
+  const bat     = document.getElementById("fBatch").value;
+  const dir     = document.getElementById("fDir").value;
+  const anomOnly= document.getElementById("fAnomaly").checked;
   const rows = ROWS.filter(r=>
     (!lvl||r.level===lvl)&&(!wid||r.worker===wid)&&
+    (bat===""||String(r.batch)===bat)&&
     (!dir||r.direction===dir)&&
+    (!anomOnly||isAnomalyRow(r))&&
     (!q||(r.event+r.detail+r.error+r.worker).toLowerCase().includes(q))
   );
   document.getElementById("count").textContent = `${rows.length}/${ROWS.length} 条`;
-  document.getElementById("tbody").innerHTML = rows.map(r=>`
-    <tr class="lvl-${r.level}">
+  document.getElementById("tbody").innerHTML = rows.map(r=>{
+    const fa = FA && r.batch===FA.batch && r.seq===FA.seq && r.worker===FA.worker
+               && isAnomalyRow(r);
+    return `
+    <tr class="lvl-${r.level}${fa?' first-anom':''}">
       <td class="ts">${r.ts}</td>
       <td class="ts">+${r.elapsed}s</td>
+      <td class="bt">${r.batch?('B'+r.batch):''}</td>
+      <td class="sq">${r.seq?('#'+r.seq):''}</td>
       <td class="wid">${r.worker}</td>
       <td class="dir ${DIR_CLASS[r.direction]||""}">${r.direction}</td>
-      <td class="evt">${r.event}</td>
+      <td class="evt">${fa?'⚑ ':''}${r.event}</td>
       <td class="detail">${esc(r.detail)}</td>
       <td class="errstr">${esc(r.error)}</td>
-    </tr>`).join("");
+    </tr>`;}).join("");
 }
 renderLog();
 
 // ── CSV 导出 ─────────────────────────────────────────────────────────────────
 function exportCSV(){
-  const hdr = ["elapsed","ts","level","worker","direction","event","detail","error"];
+  const hdr = ["elapsed","ts","batch","batch_cc","seq","level","worker","direction","event","detail","error"];
   const lines = [hdr.join(",")];
   ROWS.forEach(r=>{
-    lines.push(hdr.map(k=>'"'+String(r[k]||"").replace(/"/g,'""')+'"').join(","));
+    lines.push(hdr.map(k=>'"'+String(r[k]===undefined?"":r[k]).replace(/"/g,'""')+'"').join(","));
   });
+  // 首次异常
+  if (FA) {
+    lines.push("","# 首次异常","batch,batch_cc,seq,worker,kind,elapsed");
+    lines.push([FA.batch,FA.batch_cc,FA.seq,FA.worker,FA.kind,FA.elapsed].join(","));
+  }
   // 也附上 429 详情
-  lines.push("","# 429 详情","elapsed,code,message,retry_after,rpm,tpm");
+  lines.push("","# 429 详情","elapsed,batch,seq,worker,code,message,retry_after,rpm,tpm");
   RL.forEach(r=>{
-    lines.push([r.elapsed,r.code,'"'+r.message.replace(/"/g,'""')+'"',r.retry_after,r.rpm,r.tpm].join(","));
+    lines.push([r.elapsed,r.batch,r.seq,r.worker,r.code,'"'+r.message.replace(/"/g,'""')+'"',r.retry_after,r.rpm,r.tpm].join(","));
   });
   // 时序数据
   lines.push("","# 时序","elapsed,rpm,tpm,ok,e429,err");

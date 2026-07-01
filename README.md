@@ -60,7 +60,7 @@ python3 realtime_loadtest.py --mode transcribe \
 
 用 `session.type = "realtime"` + `output_modalities = ["text"]` 开一个**纯转写会话**，靠不发 `response.create` 来避免任何 LLM 补全，只命中 input audio transcription 模型（如 `gpt-realtime-whisper`），因此报告里的 token / RPM 全部归属转写模型本身——用来确认转写模型的配额是否被真正吃满。（`output_modalities` 不能为空数组，API 要求至少含 `text` 或 `audio`）
 
-流程：`session.update(type=realtime, output_modalities=[])` → `input_audio_buffer.append` → `input_audio_buffer.commit`（触发转写）→ 等 `conversation.item.input_audio_transcription.completed`（取 `transcript` + `usage`）。
+流程：`session.update(type=realtime, output_modalities=["text"])` → `input_audio_buffer.append` → `input_audio_buffer.commit`（触发转写）→ 等 `conversation.item.input_audio_transcription.completed`（取 `transcript` + `usage`）。
 
 - WebSocket 仍连 **realtime 部署**（`--deployment`），转写模型部署名走 `--transcribe-model`（默认 `$WHISPER_DEPLOYMENT`）
 - `--language` 可选，留空自动检测
@@ -74,6 +74,13 @@ python3 realtime_loadtest.py --mode text --ramp \
 ```
 
 从 5 并发开始，每步增加 5，每步跑 30 秒，遇到 429 立即停止并输出汇总表。
+
+**每一步就是「一批」（batch）**。压测按批递增，每批内部给每个请求一个递增序号（`#seq`），因此日志里能精确定位**第几批、第几个请求首次出现异常**：
+
+- 控制台每行日志带 `B<批号> [W<worker>#<序号>]` 前缀
+- 首次异常（429 / 失败 / 连接错误）会打印醒目横幅：`★★★ 首次异常 ★★★ 第 N 批(并发 X) · 第 M 个请求 · Wkk`
+- Ramp 汇总表新增「首次异常」列
+- HTML 报告：摘要卡片「首次异常(第几批第几个)」、日志表新增「批 / #」列 + 批次筛选 + 「仅异常」勾选、首次异常行高亮标 `⚑`、429 详情表带批次/序号、CSV 导出含 batch/seq
 
 ### 生成对峙报告
 
