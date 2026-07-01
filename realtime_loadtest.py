@@ -40,6 +40,22 @@ _SSL_CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
 
+
+def _load_dotenv(path: str = ".env") -> None:
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+
 # ─── 配置 ──────────────────────────────────────────────────────────────────────
 ENDPOINT   = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 API_KEY    = os.environ.get("AZURE_OPENAI_API_KEY", "")
@@ -224,11 +240,12 @@ async def run_text_session(
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
+                    "type": "session",
                     "modalities": ["text"],
                     "instructions": "You are a minimal assistant. Reply as briefly as possible.",
                     "temperature": 0.1,
                     "max_response_output_tokens": 20,
-                    "turn_detection": None,
+                    "turn_detection": {"type": "none"},
                 }
             }))
             await _wait_event(ws, "session.updated", timeout=10)
@@ -286,13 +303,14 @@ async def run_audio_session(
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
+                    "type": "session",
                     "modalities": ["text"],
                     "instructions": "Transcribe the audio and reply with one word.",
                     "input_audio_format": "pcm16",
                     "input_audio_transcription": {"model": "whisper-1"},
                     "temperature": 0.1,
                     "max_response_output_tokens": 10,
-                    "turn_detection": None,
+                    "turn_detection": {"type": "none"},
                 }
             }))
             await _wait_event(ws, "session.updated", timeout=10)
