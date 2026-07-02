@@ -183,6 +183,13 @@ class EventLog:
         detail = _fmt_payload(payload) if payload else ""
         self._print(self._entry("DEBUG", worker, "→", event, detail))
 
+    def trigger(self, worker, event, detail=""):
+        """请求触发点(如 commit 发出)：始终写入报告 entries(带时间戳可回溯)，
+        控制台仅 verbose 时打印，避免高并发刷屏"""
+        e = self._entry("INFO", worker, "→", event, detail)
+        if self.verbose:
+            self._print(e)
+
     def recv(self, worker, event, payload=None):
         if not self.verbose:
             return
@@ -948,13 +955,14 @@ async def run_transcribe_session(
                     await _ws_send(ws, wid, {"type": "input_audio_buffer.append",
                                              "audio": TEST_AUDIO_B64})
                     await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
+                    LOG.trigger(wid, "commit(trigger)")
                     input_tok, output_tok, audio_s, transcript = await _wait_transcription_completed(
                         ws, wid, timeout=timeout, stats=stats)
                     latency = time.monotonic() - t_req
                     usage_s = (f"dur={audio_s:.2f}s" if audio_s
                                else f"in={input_tok} out={output_tok}")
                     LOG.success(wid, "transcription.completed",
-                                f'{usage_s} lat={latency:.2f}s "{transcript[:30]}"')
+                                f'{usage_s} sent@+{t_req - _T0:.1f}s lat={latency:.2f}s "{transcript[:30]}"')
                     await stats.record_success(input_tok, output_tok, latency,
                                                audio_seconds=audio_s)
                 except RateLimitError as e:
@@ -1071,6 +1079,8 @@ async def run_transcribe_pipelined(
                     await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
                     sent_queue.append((seq, time.monotonic()))
                     sent_total += 1
+                    LOG.trigger(wid, "commit(trigger)",
+                                f"inflight={len(sent_queue) + len(inflight)}")
                 stopping = ((stop_event is not None and stop_event.is_set())
                             or (max_requests > 0 and sent_total >= max_requests))
                 if stopping and not sent_queue and not inflight:
@@ -1093,7 +1103,7 @@ async def run_transcribe_pipelined(
                     in_tok, out_tok, audio_s, transcript = _parse_transcription_usage(wid, evt)
                     usage_s = f"dur={audio_s:.2f}s" if audio_s else f"in={in_tok} out={out_tok}"
                     LOG.success(wid, "transcription.completed",
-                                f'{usage_s} lat={latency:.2f}s '
+                                f'{usage_s} sent@+{t_sent - _T0:.1f}s lat={latency:.2f}s '
                                 f'inflight={len(inflight)+len(sent_queue)} "{transcript[:30]}"')
                     await stats.record_success(in_tok, out_tok, latency,
                                                audio_seconds=audio_s)
