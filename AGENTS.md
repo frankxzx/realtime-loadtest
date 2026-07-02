@@ -29,12 +29,18 @@ git add -A && git commit -m "..." && git push
 cp .env.example .env && vi .env        # 填 endpoint / api-key / 部署名
 python3 realtime_loadtest.py --mode text      --concurrency 10 --duration 60 --html
 python3 realtime_loadtest.py --mode audio     --concurrency 5  --duration 60 --html
-python3 realtime_loadtest.py --mode transcribe --transcribe-model gpt-realtime-whisper --language en --html
+python3 realtime_loadtest.py --mode transcribe --transcribe-model gpt-realtime-whisper --language en --reuse-conn --html
 python3 realtime_loadtest.py --mode text --ramp --ramp-start 5 --ramp-max 100 --ramp-step 5
 ```
 
 三种模式：`text`(文本补全) / `audio`(语音对话) / `transcribe`(纯转写，独立测 whisper 配额)。
 `--ramp` 分批递增并发找 429 临界点。`--html` 生成自包含报告。
+
+**测 whisper 上限必须加 `--reuse-conn`**：转写要经由 realtime 会话才到得了转写模型，
+两级配额是串联的。默认（不复用）每次转写都新建 realtime 会话，429 会先撞
+realtime 部署的会话创建限流，whisper 根本没被打满。`--reuse-conn` 让每个 worker
+只建一次会话，在同一条 WS 上循环 append→commit→completed，负载才真正落到转写模型。
+确认 429 归属看 `rate_limits.updated` 的 `name` 字段（报告里单列）。
 
 ## 代码结构（单文件分区）
 

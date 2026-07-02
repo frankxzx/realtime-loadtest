@@ -55,8 +55,10 @@ python3 realtime_loadtest.py --mode audio --concurrency 5 --duration 60
 ```bash
 python3 realtime_loadtest.py --mode transcribe \
   --transcribe-model gpt-realtime-whisper --language en \
-  --concurrency 10 --duration 60 --html
+  --reuse-conn --concurrency 10 --duration 60 --html
 ```
+
+> **测转写模型上限必须加 `--reuse-conn`。** 转写请求必须经由 realtime 会话才到得了转写模型，两级配额是串联的：默认（不复用）每次转写都新建 realtime 会话，429 会先撞 **realtime 部署的会话创建限流**，转写模型根本没被打满。`--reuse-conn` 让每个 worker 只建一次会话，在同一条 WS 上循环 `append → commit → completed`，负载才真正落到转写模型上。429 归属看 `rate_limits.updated` 的 `name` 字段（报告里单列）。
 
 用 `session.type = "realtime"` + `output_modalities = ["text"]` 开一个**纯转写会话**，靠不发 `response.create` 来避免任何 LLM 补全，只命中 input audio transcription 模型（如 `gpt-realtime-whisper`），因此报告里的 token / RPM 全部归属转写模型本身——用来确认转写模型的配额是否被真正吃满。（`output_modalities` 不能为空数组，API 要求至少含 `text` 或 `audio`）
 
@@ -142,6 +144,7 @@ python3 realtime_loadtest.py \
 | `--deployment` | `$REALTIME_DEPLOYMENT` | realtime 部署名（WS 连接用） |
 | `--transcribe-model` | `$WHISPER_DEPLOYMENT` | 转写模型部署名（仅 `transcribe` 模式） |
 | `--language` | — | 转写语言 ISO-639-1（仅 `transcribe` 模式，留空自动检测） |
+| `--reuse-conn` | 关 | `transcribe` 模式复用 WS：每 worker 一次会话内循环转写，测转写模型上限必开 |
 | `--concurrency` | `5` | 并发 WebSocket 连接数 |
 | `--duration` | `60` | 压测持续秒数 |
 | `--interval` | `0` | 每个 worker 两次请求间隔（秒） |

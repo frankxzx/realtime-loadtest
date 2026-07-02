@@ -836,6 +836,8 @@ async def run_audio_session(
 async def run_transcribe_session(
     stats: GlobalStats, deployment: str, worker_id: int,
     transcribe_model: str, language: str = "", timeout: float = 45.0,
+    reuse: bool = False, stop_event: asyncio.Event | None = None,
+    request_interval: float = 0.0,
 ) -> None:
     """
     纯转写会话：session.type="realtime" + output_modalities=["text"]，靠不发
@@ -844,6 +846,11 @@ async def run_transcribe_session(
     连接走 realtime 部署，转写模型部署名放在 audio.input.transcription.model。
     turn_detection=None，手动 commit 触发转写。
     (output_modalities 不能为空数组，API 要求至少含 text 或 audio)
+
+    reuse=True：同一条 WS 上循环 append→commit→completed，直到 stop_event。
+    每次 commit 都是独立的转写请求，但 realtime 会话只建一次——不这样做的话
+    每个转写都要新建 realtime 会话，realtime 部署的连接级 429 会先于 whisper
+    配额触发，测不到转写模型自己的上限。
     """
     wid = f"W{worker_id:02d}"
     t_start = time.monotonic()
@@ -874,14 +881,38 @@ async def run_transcribe_session(
                 },
             })
             await _wait_event(ws, wid, "session.updated", timeout=10)
-            await _ws_send(ws, wid, {"type": "input_audio_buffer.append", "audio": TEST_AUDIO_B64})
-            await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
-            input_tok, output_tok, transcript = await _wait_transcription_completed(
-                ws, wid, timeout=timeout, stats=stats)
-            latency = time.monotonic() - t_start
-            LOG.success(wid, "transcription.completed",
-                        f'in={input_tok} out={output_tok} lat={latency:.2f}s "{transcript[:30]}"')
-            await stats.record_success(input_tok, output_tok, latency)
+            n_done = 0
+            while True:
+                if n_done:  # 复用连接的后续请求：换新 seq，重新计时
+                    _CTX_SEQ.set(stats.next_seq())
+                t_req = t_start if n_done == 0 else time.monotonic()
+                try:
+                    await _ws_send(ws, wid, {"type": "input_audio_buffer.append",
+                                             "audio": TEST_AUDIO_B64})
+                    await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
+                    input_tok, output_tok, transcript = await _wait_transcription_completed(
+                        ws, wid, timeout=timeout, stats=stats)
+                    latency = time.monotonic() - t_req
+                    LOG.success(wid, "transcription.completed",
+                                f'in={input_tok} out={output_tok} lat={latency:.2f}s "{transcript[:30]}"')
+                    await stats.record_success(input_tok, output_tok, latency)
+                except RateLimitError as e:
+                    # 转写级限流（transcription.failed / error 事件）：会话还活着，
+                    # 复用模式下记录后继续压——这正是我们要测的 whisper 429
+                    LOG.rate_limit(wid, f"[{e.code}] {e}")
+                    await stats.record_rate_limit(str(e), e.code, e.retry_after)
+                    if not reuse:
+                        return
+                except TranscriptionFailed as e:
+                    LOG.error(wid, "transcription.failed", f"[{e.code}] {e}")
+                    await stats.record_transcription_failure(str(e), e.code)
+                    if not reuse:
+                        return
+                n_done += 1
+                if not reuse or (stop_event is not None and stop_event.is_set()):
+                    return
+                if request_interval > 0:
+                    await asyncio.sleep(request_interval)
 
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
@@ -910,6 +941,7 @@ async def worker_loop(
     stats: GlobalStats, mode: str, deployment: str,
     stop_event: asyncio.Event, worker_id: int, request_interval: float = 0.0,
     transcribe_model: str = "", language: str = "",
+    reuse_conn: bool = False,
 ) -> None:
     # 每个 worker 是独立 task，contextvars 互不干扰
     _CTX_BATCH.set(stats.batch_index)
@@ -921,8 +953,11 @@ async def worker_loop(
         if mode == "text":
             await run_text_session(stats, deployment, worker_id, idx)
         elif mode == "transcribe":
+            # reuse_conn: 会话内部自循环直到 stop_event；连接挂了才回到这里重连
             await run_transcribe_session(stats, deployment, worker_id,
-                                         transcribe_model, language)
+                                         transcribe_model, language,
+                                         reuse=reuse_conn, stop_event=stop_event,
+                                         request_interval=request_interval)
         else:
             await run_audio_session(stats, deployment, worker_id)
         idx += 1
@@ -965,7 +1000,7 @@ async def monitor_loop(
 async def run_load_test(
     mode: str, deployment: str, concurrency: int, duration: float,
     request_interval: float = 0.0, transcribe_model: str = "", language: str = "",
-    batch_index: int = 1,
+    batch_index: int = 1, reuse_conn: bool = False,
 ) -> GlobalStats:
     print(f"\n{_C['bold']}[压测]{_C['reset']} "
           f"第{batch_index}批 mode={mode} deployment={deployment} "
@@ -973,7 +1008,11 @@ async def run_load_test(
     print(f"  endpoint: {build_ws_url(deployment)}")
     if mode == "transcribe":
         print(f"  transcription model: {transcribe_model}"
-              f"{f'  language={language}' if language else ''}")
+              f"{f'  language={language}' if language else ''}"
+              f"{'  [复用连接: 每 worker 一条 WS 循环转写]' if reuse_conn else ''}")
+        if not reuse_conn:
+            print(f"  {_C['yellow']}提示: 未加 --reuse-conn，每次转写都新建 realtime 会话，"
+                  f"429 可能来自 realtime 部署而非转写模型{_C['reset']}")
 
     stats = GlobalStats()
     stats.batch_index = batch_index
@@ -982,7 +1021,7 @@ async def run_load_test(
     workers = [
         asyncio.create_task(
             worker_loop(stats, mode, deployment, stop_event, i, request_interval,
-                        transcribe_model, language)
+                        transcribe_model, language, reuse_conn)
         )
         for i in range(concurrency)
     ]
@@ -1001,6 +1040,7 @@ async def run_ramp_test(
     mode: str, deployment: str,
     ramp_start: int, ramp_max: int, ramp_step: int, step_duration: float,
     transcribe_model: str = "", language: str = "",
+    reuse_conn: bool = False,
 ) -> tuple[list[dict], GlobalStats | None]:
     print(f"\n[Ramp] {ramp_start}→{ramp_max} 并发，每步 {step_duration}s")
     results = []
@@ -1012,7 +1052,8 @@ async def run_ramp_test(
         batch_no += 1
         print(f"\n{'='*50}\n>>> 第 {batch_no} 批  并发: {concurrency}")
         stats = await run_load_test(mode, deployment, concurrency, step_duration,
-                                    0.0, transcribe_model, language, batch_index=batch_no)
+                                    0.0, transcribe_model, language,
+                                    batch_index=batch_no, reuse_conn=reuse_conn)
         last_stats = stats
         s = stats.summary()
         s["concurrency"] = concurrency
@@ -1063,6 +1104,10 @@ def parse_args() -> argparse.Namespace:
                    help="转写模型部署名(仅 transcribe 模式)，默认 $WHISPER_DEPLOYMENT")
     p.add_argument("--language",    default="",
                    help="转写语言 ISO-639-1(如 en/zh)，留空自动检测(仅 transcribe 模式)")
+    p.add_argument("--reuse-conn",  action="store_true",
+                   help="transcribe 模式复用 WS 连接：每 worker 建一次 realtime 会话，"
+                        "在同一连接上循环 commit 转写。测 whisper 上限必开，否则 429 "
+                        "会先撞 realtime 部署的会话创建限流")
     p.add_argument("--concurrency", type=int,   default=5)
     p.add_argument("--duration",    type=float, default=60.0)
     p.add_argument("--interval",    type=float, default=0.0)
@@ -1117,6 +1162,7 @@ def main() -> None:
                     args.ramp_start, args.ramp_max,
                     args.ramp_step, args.ramp_step_duration,
                     args.transcribe_model, args.language,
+                    reuse_conn=args.reuse_conn,
                 )
             )
         else:
@@ -1125,6 +1171,7 @@ def main() -> None:
                     args.mode, args.deployment,
                     args.concurrency, args.duration, args.interval,
                     args.transcribe_model, args.language,
+                    reuse_conn=args.reuse_conn,
                 )
             )
             s = stats.summary()
@@ -1150,6 +1197,7 @@ def main() -> None:
                 "endpoint":        ENDPOINT,
                 "deployment":      args.deployment,
                 "transcribe_model": args.transcribe_model if args.mode == "transcribe" else "",
+                "reuse_conn":      args.reuse_conn,
                 "region":          args.region,
                 "mode":            args.mode,
                 "concurrency":     args.concurrency,
