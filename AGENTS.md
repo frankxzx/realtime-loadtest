@@ -58,6 +58,15 @@ duration。
 注意：RST 到达静默期时异常要等下一次 IO 才抛，代码里靠 `ws.close_code` 预检把死在
 静默期的归因给 idle_gap——别把这个判断删了。
 
+**本地复现 1006（带病客户端 A/B 对照）**：`mock_gateway.py` 是仓库自带的「严格网关」
+mock（明文 ws://，pong 超时 5s 直接 `transport.abort()` 发 RST 不发 close frame，
+客户端视角=1006）。`--sim-pcm-accumulate`(`SimPcmClient`) 复刻生产病灶：后台任务
+`bytes += chunk` 录音累积(O(n²)，按墙钟补账保正反馈)+每轮说完同步“转码”忙等阻塞。
+同参数不带/带此开关各跑一遍即 A/B 对照，命令见 README「本地复现 1006」。
+相关：连 mock 时 endpoint 用 `http://`，`_ssl_arg()` 会自动不传 ssl（ws:// 传 ssl
+会被 websockets 拒）。sim 病情别开太猛（rate 60+ 且并发 8+ 会把事件循环冻死到
+脚本自己都收不了尾），rate 30/并发 6 足够复现。
+
 **测 whisper 上限必须加 `--reuse-conn`（最好再加 `--pipeline`）**：转写要经由 realtime
 会话才到得了转写模型，两级配额是串联的。默认（不复用）每次转写都新建 realtime 会话，
 429 会先撞 realtime 部署的会话创建限流（S0 tier onHandshake），whisper 根本没被打满。

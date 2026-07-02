@@ -120,6 +120,32 @@ python3 realtime_loadtest.py --mode chat --concurrency 100 --session-loop \
 
 排查 keepalive 假设可调 `--ping-interval` / `--ping-timeout`（默认 20/20s；`--ping-interval 0` 禁用客户端 ping，看纯靠服务端 ping 会不会被掐）。
 
+### 本地复现 1006：带病客户端 A/B 对照（`--sim-pcm-accumulate` + `mock_gateway.py`）
+
+如果怀疑 1006 的根因在**自己客户端**（典型病灶：录音用 bytes 属性 `buf += pcm_chunk` 累积——O(n²) 全量复制；以及"说完一轮同步转 MP3"跑在事件循环上），可以在本地闭环复现，不用碰 Azure：
+
+```bash
+# 终端 1：严格网关 mock——每 5s ping 一次，5s 等不到 pong 直接 RST（不发 close frame，
+#         客户端视角就是 1006，与生产网关行为一致）
+python3 mock_gateway.py --port 9800
+
+# 终端 2：
+export AZURE_OPENAI_ENDPOINT=http://127.0.0.1:9800 AZURE_OPENAI_API_KEY=local
+
+# A 干净对照组：预期 0 断连、loop lag 几 ms
+python3 realtime_loadtest.py --mode chat --concurrency 8 --session-loop \
+  --turn-gap 2 --duration 60 --connect-stagger 0.05
+
+# B 带病实验组：预期 loop lag 飙到秒级、1006 全进程成簇
+python3 realtime_loadtest.py --mode chat --concurrency 6 --session-loop \
+  --turn-gap 2 --duration 75 --connect-stagger 0.05 \
+  --sim-pcm-accumulate --sim-rate-mb-min 30
+```
+
+`--sim-pcm-accumulate` 给每条连接开一个后台"录音"任务，完整复刻病灶：`bytes += chunk`（按墙钟补账，事件循环卡住期间"到达"的帧解卡后突发处理——复刻"越卡越追账、越追越卡"的正反馈），且每轮说完后按 `--sim-encode-mbps`（默认 5MB/s）同步"转码"硬阻塞。`--sim-rate-mb-min` 默认 2.88（24kHz/16bit 真实速率）；本地快速复现调到 30~60，等效于把通话时间轴压缩、几十秒内看到第 5-7 分钟的病情。
+
+判读：A、B 唯一区别是客户端有没有病，服务端（mock）完全相同。若 A 组 0 断连、B 组 1006 且伴随 loop-lag 告警——1006 是客户端事件循环被强占导致 pong 超时被网关掐，与服务端无关。生产验证同理：给生产进程加 loop-lag 探针、把 1006 时间戳和"通话结束/导出 MP3"时刻对表。修复：缓冲改 `bytearray.extend()`（或 list 攒块最后 `join`），转码用 `asyncio.create_subprocess_exec` 异步调 ffmpeg 或丢给独立 worker 进程——编码一毫秒都不该发生在事件循环线程上。
+
 ## 429 与所有异常来源（重要）
 
 Realtime API 是 WebSocket，**429 不是单一的 HTTP 报错**——取决于什么时候撞限流，会以不同形式出现（已对照 [Azure 官方文档](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio-websockets) 与 [OpenAI Realtime 规范](https://developers.openai.com/api/docs/guides/realtime) 核实）：
@@ -207,6 +233,9 @@ python3 realtime_loadtest.py \
 | `--turn-gap` | `0` | 仅 `chat` 模式：每轮回复后静默秒数（坐席讲话中 WS 完全空闲），真实通话形态建议 30~60 |
 | `--ping-interval` | `20` | `chat` 模式 WS keepalive ping 间隔秒，`0` 禁用客户端 ping |
 | `--ping-timeout` | `20` | `chat` 模式等 pong 超时秒，超时客户端按 keepalive 失败断开 |
+| `--sim-pcm-accumulate` | 关 | 仅 `chat` 模式：带病客户端模拟（`bytes+=` 录音累积 + 每轮同步转码阻塞），本地复现 1006 用 |
+| `--sim-rate-mb-min` | `2.88` | 模拟录音累积速率 MB/分钟（2.88=24kHz/16bit 真实速率；快速复现用 30~60） |
+| `--sim-encode-mbps` | `5` | 模拟同步转码速度 MB/s，阻塞时长=缓冲/速度；`0` 只累积不转码 |
 | `--deployment` | `$REALTIME_DEPLOYMENT` | realtime 部署名（WS 连接用） |
 | `--transcribe-model` | `$WHISPER_DEPLOYMENT` | 转写模型部署名（仅 `transcribe` 模式） |
 | `--language` | — | 转写语言 ISO-639-1（仅 `transcribe` 模式，留空自动检测） |
