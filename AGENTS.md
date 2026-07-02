@@ -33,10 +33,20 @@ python3 realtime_loadtest.py --mode text      --concurrency 10 --duration 60 --h
 python3 realtime_loadtest.py --mode audio     --concurrency 5  --duration 60 --html
 python3 realtime_loadtest.py --mode transcribe --transcribe-model gpt-realtime-whisper --language en --reuse-conn --pipeline 10 --html
 python3 realtime_loadtest.py --mode text --ramp --ramp-start 5 --ramp-max 100 --ramp-step 5
+python3 realtime_loadtest.py --mode chat --concurrency 100 --sync-fire --html
 ```
 
-三种模式：`text`(文本补全) / `audio`(语音对话) / `transcribe`(纯转写，独立测 whisper 配额)。
+四种模式：`text`(文本补全) / `audio`(语音对话) / `transcribe`(纯转写，独立测 whisper 配额) /
+`chat`(保险坐席对话场景：mock 多轮历史+坐席一轮≈1分钟话术，AI 扮演客户)。
 `--ramp` 分批递增并发找 429 临界点。`--html` 生成自包含报告。
+
+**chat 模式 / --sync-fire（同一时间戳齐射）**：内置 3 个保险话本（`CHAT_SCENARIOS`，按
+worker 轮换），历史经 `conversation.item.create` 注入——坐席=`user`/`input_text`，
+客户=`assistant`/`output_text`（GA schema，assistant 历史消息**不是** beta 的 `text`）。
+`--sync-fire` = 全员错峰握手+注好历史后集合（`SyncFire`），同一时刻齐发一轮
+`response.create` 即止（忽略 duration），测「同一时间戳 N 并发」；worker 没走到集合点
+就挂的话会 `abandon()`，别删这个兜底，否则全场死等。不加 `--sync-fire` 则循环话本到
+duration。
 
 **测 whisper 上限必须加 `--reuse-conn`（最好再加 `--pipeline`）**：转写要经由 realtime
 会话才到得了转写模型，两级配额是串联的。默认（不复用）每次转写都新建 realtime 会话，
@@ -63,7 +73,8 @@ python3 realtime_loadtest.py --mode text --ramp --ramp-start 5 --ramp-max 100 --
 | `GlobalStats` | 计数/滚动 RPM·TPM/首次异常/rate_limits 上报，per-batch |
 | 测试音频 | 自带 `hello_world.wav` → say 直出 PCM → 正弦波（三级兜底） |
 | WS 助手 | `_ws_send` / `_wait_event` / `_wait_response_done` / `_wait_transcription_completed` |
-| 会话 | `run_text_session` / `run_audio_session` / `run_transcribe_session` |
+| 会话 | `run_text_session` / `run_chat_session`(+`SyncFire`) / `run_audio_session` / `run_transcribe_session` |
+| chat 场景数据 | `CHAT_CUSTOMER_INSTRUCTIONS` / `CHAT_SCENARIOS`(3 个保险话本，坐席一轮≈280字) |
 | 编排 | `worker_loop` / `monitor_loop` / `run_load_test` / `run_ramp_test` |
 | CLI / main | `parse_args` / `main` |
 | `_HTML_TEMPLATE` | 自包含深色报告（卡片/异常分类/时序图/429详情/配额/日志表/CSV） |
