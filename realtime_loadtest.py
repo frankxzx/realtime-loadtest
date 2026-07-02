@@ -240,6 +240,8 @@ class GlobalStats:
     input_tokens:        int   = 0
     output_tokens:     int   = 0
     total_tokens:      int   = 0
+    # whisper 家族按音频时长计费(usage.type=="duration"，无 token)，累计转写秒数
+    transcribed_seconds: float = 0.0
 
     req_timestamps:   deque = field(default_factory=deque)
     token_timestamps: deque = field(default_factory=deque)
@@ -284,7 +286,8 @@ class GlobalStats:
               f"{_C['yellow']}第 {b} 批(并发 {cc}) · 第 {s} 个请求 · {w}{_C['reset']} "
               f"[{kind}] @ +{elapsed:.1f}s  {detail[:80]}\n")
 
-    async def record_success(self, input_tok: int, output_tok: int, latency: float):
+    async def record_success(self, input_tok: int, output_tok: int, latency: float,
+                             audio_seconds: float = 0.0):
         async with self.lock:
             now = time.monotonic()
             self.total_requests += 1
@@ -292,6 +295,7 @@ class GlobalStats:
             self.input_tokens  += input_tok
             self.output_tokens += output_tok
             self.total_tokens  += input_tok + output_tok
+            self.transcribed_seconds += audio_seconds
             self.latencies.append(latency)
             self.req_timestamps.append(now)
             for _ in range(input_tok + output_tok):
@@ -471,6 +475,8 @@ class GlobalStats:
             "input_tokens":       self.input_tokens,
             "output_tokens":      self.output_tokens,
             "total_tokens":       self.total_tokens,
+            "transcribed_audio_s": round(self.transcribed_seconds, 1),
+            "avg_audio_s_per_min": round(self.transcribed_seconds / elapsed * 60, 1) if elapsed > 0 else 0,
             "avg_rpm":            round(self.success / elapsed * 60, 1) if elapsed > 0 else 0,
             "avg_tpm":            round(self.total_tokens / elapsed * 60, 1) if elapsed > 0 else 0,
             "peak_rpm":           round(self.peak_rpm, 1),
@@ -643,9 +649,23 @@ async def _wait_response_done(ws, worker: str, timeout: float, stats=None) -> tu
             _raise_ws_error(evt)
 
 
-def _parse_transcription_usage(worker: str, evt: dict) -> tuple[int, int, str]:
-    """从 transcription.completed 事件解析 (in_tok, out_tok, transcript)"""
-    usage   = evt.get("usage", {}) or {}
+_USAGE_MISSING_WARNED = False   # usage 真缺失只警告一次，别刷屏
+
+
+def _parse_transcription_usage(worker: str, evt: dict) -> tuple[int, int, float, str]:
+    """从 transcription.completed 事件解析 (in_tok, out_tok, audio_seconds, transcript)。
+
+    usage 有两种官方形态：
+    - tokens:   {input_tokens, output_tokens, input_token_details...}（gpt-4o-transcribe 系）
+    - duration: {"type":"duration","seconds":N}（whisper 家族按音频时长计费，无 token，
+      gpt-realtime-whisper 即此类——不是异常，别告警）
+    """
+    global _USAGE_MISSING_WARNED
+    usage      = evt.get("usage", {}) or {}
+    transcript = evt.get("transcript", "")
+    # whisper 家族：按时长计费，正常形态
+    if usage.get("type") == "duration":
+        return 0, 0, float(usage.get("seconds") or 0.0), transcript
     details = usage.get("input_token_details", {}) or {}
     in_tok  = usage.get("input_tokens", 0)
     out_tok = usage.get("output_tokens", 0)
@@ -655,16 +675,18 @@ def _parse_transcription_usage(worker: str, evt: dict) -> tuple[int, int, str]:
     # 兜底2: 仍拿到 total 但拆不出，用 total 当 in
     if not in_tok and usage.get("total_tokens"):
         in_tok = usage["total_tokens"] - out_tok
-    # 诊断: usage 缺失/全 0 时把原始事件打出来（whisper-1 按时长计费则 usage.type=="duration"）
-    if not usage or (in_tok == 0 and out_tok == 0):
-        LOG.warn(worker, "transcription usage 缺失/为0",
+    # 诊断: tokens/duration 两种形态都没有才算真缺失，只报一次
+    if (not usage or (in_tok == 0 and out_tok == 0)) and not _USAGE_MISSING_WARNED:
+        _USAGE_MISSING_WARNED = True
+        LOG.warn(worker, "transcription usage 缺失(仅提示一次)",
                  json.dumps({k: v for k, v in evt.items() if k != "logprobs"})[:300])
-    return in_tok, out_tok, evt.get("transcript", "")
+    return in_tok, out_tok, 0.0, transcript
 
 
 async def _wait_transcription_completed(ws, worker: str, timeout: float,
-                                        stats=None) -> tuple[int, int, str]:
-    """等待 conversation.item.input_audio_transcription.completed，返回 (in_tok, out_tok, transcript)"""
+                                        stats=None) -> tuple[int, int, float, str]:
+    """等待 conversation.item.input_audio_transcription.completed，
+    返回 (in_tok, out_tok, audio_seconds, transcript)"""
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -909,12 +931,15 @@ async def run_transcribe_session(
                     await _ws_send(ws, wid, {"type": "input_audio_buffer.append",
                                              "audio": TEST_AUDIO_B64})
                     await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
-                    input_tok, output_tok, transcript = await _wait_transcription_completed(
+                    input_tok, output_tok, audio_s, transcript = await _wait_transcription_completed(
                         ws, wid, timeout=timeout, stats=stats)
                     latency = time.monotonic() - t_req
+                    usage_s = (f"dur={audio_s:.2f}s" if audio_s
+                               else f"in={input_tok} out={output_tok}")
                     LOG.success(wid, "transcription.completed",
-                                f'in={input_tok} out={output_tok} lat={latency:.2f}s "{transcript[:30]}"')
-                    await stats.record_success(input_tok, output_tok, latency)
+                                f'{usage_s} lat={latency:.2f}s "{transcript[:30]}"')
+                    await stats.record_success(input_tok, output_tok, latency,
+                                               audio_seconds=audio_s)
                 except RateLimitError as e:
                     # 转写级限流（transcription.failed / error 事件）：会话还活着，
                     # 复用模式下记录后继续压——这正是我们要测的 whisper 429
@@ -1039,11 +1064,13 @@ async def run_transcribe_pipelined(
                     seq, t_sent = _settle(evt.get("item_id", ""))
                     _CTX_SEQ.set(seq)
                     latency = time.monotonic() - t_sent
-                    in_tok, out_tok, transcript = _parse_transcription_usage(wid, evt)
+                    in_tok, out_tok, audio_s, transcript = _parse_transcription_usage(wid, evt)
+                    usage_s = f"dur={audio_s:.2f}s" if audio_s else f"in={in_tok} out={out_tok}"
                     LOG.success(wid, "transcription.completed",
-                                f'in={in_tok} out={out_tok} lat={latency:.2f}s '
+                                f'{usage_s} lat={latency:.2f}s '
                                 f'inflight={len(inflight)+len(sent_queue)} "{transcript[:30]}"')
-                    await stats.record_success(in_tok, out_tok, latency)
+                    await stats.record_success(in_tok, out_tok, latency,
+                                               audio_seconds=audio_s)
                 elif t == "conversation.item.input_audio_transcription.failed":
                     seq, _ = _settle((evt.get("item_id") or ""))
                     _CTX_SEQ.set(seq)
@@ -1581,6 +1608,8 @@ const peak_tpm  = SUM.peak_tpm || 0;
 const ok_rate   = SUM.success_rate_pct || 0;
 const f429      = SUM.first_429_elapsed_s;
 const FA        = SUM.first_anomaly;   // {batch,batch_cc,seq,worker,elapsed,kind}
+// whisper 家族按音频时长计费(无 token)：Token/TPM 卡片换成时长指标
+const durMode   = (SUM.total_tokens||0) === 0 && (SUM.transcribed_audio_s||0) > 0;
 const faText    = FA ? `第${FA.batch}批(并发${FA.batch_cc}) 第${FA.seq}个 · ${FA.worker}` : "—";
 const faSub     = FA ? `${FA.kind} @ +${FA.elapsed}s` : "全程无异常";
 
@@ -1595,7 +1624,9 @@ const cards = [
   {label:"总请求数",   value: (SUM.total_requests||0).toLocaleString(), sub:"",       cls:""},
   {label:"成功率",     value: ok_rate+"%",                              sub:`成功 ${(SUM.success||0).toLocaleString()} 次`, cls: ok_rate>=95?"good":ok_rate>=80?"warn":"danger"},
   {label:"峰值 RPM",   value: peak_rpm.toLocaleString(),               sub: quotaLine(peak_rpm, quota_rpm, "RPM"),    cls: quota_rpm&&peak_rpm<quota_rpm*0.7?"danger":""},
-  {label:"峰值 TPM",   value: peak_tpm.toLocaleString(),               sub: quotaLine(peak_tpm, quota_tpm, "TPM"),    cls: quota_tpm&&peak_tpm<quota_tpm*0.7?"danger":""},
+  durMode
+    ? {label:"转写速率", value: (SUM.avg_audio_s_per_min||0)+"s/min", sub:"每分钟转写的音频秒数(whisper 按时长计费)", cls:""}
+    : {label:"峰值 TPM", value: peak_tpm.toLocaleString(),            sub: quotaLine(peak_tpm, quota_tpm, "TPM"),    cls: quota_tpm&&peak_tpm<quota_tpm*0.7?"danger":""},
   {label:"429 次数",   value: (SUM.rate_limited_429||0).toLocaleString(),
    sub: SUM.rate_limited_429>0
      ? `握手(连接级) ${SUM.rate_limited_handshake||0} · 会话内(模型配额) ${SUM.rate_limited_session||0}${f429!=null?` · 首次 +${f429}s`:""}`
@@ -1604,7 +1635,9 @@ const cards = [
   {label:"首次异常(第几批第几个)", value: faText,                        sub: faSub,  cls: FA?"danger":"good"},
   {label:"首次限流时",  value: f429!=null?"+"+f429+"s":"—",            sub: f429!=null?`RPM=${SUM.first_429_rpm} TPM=${SUM.first_429_tpm}`:"",  cls: f429!=null?"danger":""},
   {label:"P95 延迟",   value: (SUM.latency_p95_ms||0)+"ms",           sub:`P99=${SUM.latency_p99_ms||0}ms Max=${SUM.latency_max_ms||0}ms`, cls:""},
-  {label:"总 Token",   value: (SUM.total_tokens||0).toLocaleString(),  sub:`in=${(SUM.input_tokens||0).toLocaleString()} out=${(SUM.output_tokens||0).toLocaleString()}`, cls:""},
+  durMode
+    ? {label:"转写音频总时长", value: (SUM.transcribed_audio_s||0)+"s", sub:`≈ ${((SUM.transcribed_audio_s||0)/60).toFixed(1)} 分钟 · whisper 无 token 计数`, cls:""}
+    : {label:"总 Token", value: (SUM.total_tokens||0).toLocaleString(), sub:`in=${(SUM.input_tokens||0).toLocaleString()} out=${(SUM.output_tokens||0).toLocaleString()}`, cls:""},
 ];
 document.getElementById("cards").innerHTML = cards.map(c =>
   `<div class="card ${c.cls}">

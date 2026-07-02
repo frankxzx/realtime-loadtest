@@ -69,7 +69,8 @@ python3 realtime_loadtest.py --mode transcribe \
 
 - WebSocket 仍连 **realtime 部署**（`--deployment`），转写模型部署名走 `--transcribe-model`（默认 `$WHISPER_DEPLOYMENT`）
 - `--language` 可选，留空自动检测
-- `whisper-1` 是按时长计费（无 token）；`gpt-realtime-whisper` 按 token 计费，报告 TPM 才有意义
+- **whisper 家族（含 `gpt-realtime-whisper`）按音频时长计费**（$0.017/分钟），`completed` 事件的 `usage` 是 `{"type":"duration","seconds":N}`，**没有 token 计数**——这是官方行为，不是异常。脚本识别此形态：累计"转写音频秒数"，报告里 Token/TPM 卡片自动换成「转写速率 (s/min)」和「转写音频总时长」；whisper 场景看 **RPM 和转写速率**，TPM 恒为 0 无意义
+- `gpt-4o-transcribe` 系才按 token 计费（`usage` 带 `input_tokens`/`output_tokens`），报告 TPM 有意义
 
 ## 429 与所有异常来源（重要）
 
