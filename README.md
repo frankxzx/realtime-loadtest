@@ -62,6 +62,14 @@ python3 realtime_loadtest.py --mode transcribe \
 >
 > - `--reuse-conn`（串行复用）：每 worker 一次握手，同一条 WS 循环 `append → commit → completed`。但每连接同时只有 **1 个在途转写**，吞吐被单次转写延迟（~4.5s）限死——10 并发每分钟才 ~130 次。
 > - `--pipeline N`（管道化，隐含复用）：`commit` 是异步的，**不等上一个 completed 就连发 N 个 commit**，服务端并行转写、完成事件按 `item_id` 对账（官方文档明确"完成事件顺序不保证，用 item_id 匹配"）。总在途 = 并发 × N：`--concurrency 10 --pipeline 10` = **100 个在途转写，只需 10 次握手**，这才是打满转写模型配额的压力形态。
+> - `--burst N`（脉冲）：持续模式（`--duration`）测的是"稳态能扛多少"；burst 测的是"**瞬间打 N 个会发生什么**"。N 个请求按并发均分，每条连接**一口气 commit 完不等回包**，然后等全部结算：成功多少、`session` 429 多少、什么错误码，一目了然。`--burst 1000 --concurrency 10` = 瞬间 1000 个在途转写。
+
+```bash
+# 脉冲测试：一次性打 1000 个转写请求，看服务端在什么量级报什么错
+python3 realtime_loadtest.py --mode transcribe \
+  --transcribe-model gpt-realtime-whisper --language en \
+  --burst 1000 --concurrency 10 --html
+```
 
 用 `session.type = "realtime"` + `output_modalities = ["text"]` 开一个**纯转写会话**，靠不发 `response.create` 来避免任何 LLM 补全，只命中 input audio transcription 模型（如 `gpt-realtime-whisper`），因此报告里的 token / RPM 全部归属转写模型本身——用来确认转写模型的配额是否被真正吃满。（`output_modalities` 不能为空数组，API 要求至少含 `text` 或 `audio`）
 
@@ -159,6 +167,7 @@ python3 realtime_loadtest.py \
 | `--language` | — | 转写语言 ISO-639-1（仅 `transcribe` 模式，留空自动检测） |
 | `--reuse-conn` | 关 | `transcribe` 模式复用 WS：每 worker 一次会话内循环转写，测转写模型上限必开 |
 | `--pipeline` | `1` | 每条连接在途转写数（管道深度），>1 隐含复用连接；总在途=并发×管道 |
+| `--burst` | `0` | 脉冲模式（仅 `transcribe`）：N 个请求按并发均分、每连接一口气 commit 完，等全部结算后结束，忽略 `--duration` |
 | `--connect-stagger` | `0.25` | worker 首次握手错峰间隔（秒/个），防一批 worker 同时握手撞 S0 tier 连接速率（`onHandshake` 429）；设 0 关闭 |
 | `--concurrency` | `5` | 并发 WebSocket 连接数 |
 | `--duration` | `60` | 压测持续秒数 |

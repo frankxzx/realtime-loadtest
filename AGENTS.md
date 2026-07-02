@@ -44,6 +44,10 @@ python3 realtime_loadtest.py --mode text --ramp --ramp-start 5 --ramp-max 100 --
 - `--pipeline N`：管道化（隐含复用）。commit 是异步的，不等 completed 连发 N 个 commit，
   服务端并行转写，completed 乱序回来按 `item_id` 对账（官方文档明确此用法）。
   总在途 = concurrency×N，如 `--concurrency 10 --pipeline 10` = 100 在途只需 10 次握手。
+- `--burst N`：脉冲模式。N 个请求按并发均分，每连接一口气 commit 完等全部结算后结束
+  （忽略 duration，不重连不补发）。测"瞬间打 N 个会怎么报错"，与 --ramp 互斥。
+- whisper 按音频时长计费（usage.type=="duration"，无 token）：吞吐指标是 RPM 和
+  转写速率(s/min)，TPM 恒 0 是正常的，报告卡片自动切换。
 确认 429 归属看报告的「来源」列：`handshake`=连接级(非模型配额)，`session`=模型配额。
 
 ## 代码结构（单文件分区）

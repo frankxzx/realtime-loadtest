@@ -985,6 +985,7 @@ async def run_transcribe_pipelined(
     stats: GlobalStats, deployment: str, worker_id: int,
     transcribe_model: str, language: str = "", timeout: float = 45.0,
     pipeline: int = 8, stop_event: asyncio.Event | None = None,
+    max_requests: int = 0,
 ) -> None:
     """
     管道化转写：不等上一个转写完成就连续 append→commit，保持每条连接
@@ -996,6 +997,8 @@ async def run_transcribe_pipelined(
     转写延迟(~4.5s)限死。
     配对：input_audio_buffer.committed 的 item_id 按 FIFO 对应 commit 顺序，
     completed/failed 按 item_id 结算 latency 与 seq 归属。
+    max_requests>0 = burst 模式：本连接总共只发这么多个 commit，发完 drain
+    （等全部在途结算）后返回，不再补发。
     """
     wid = f"W{worker_id:02d}"
     transcription: dict = {"model": transcribe_model}
@@ -1037,16 +1040,22 @@ async def run_transcribe_pipelined(
             })
             await _wait_event(ws, wid, "session.updated", timeout=10)
 
+            sent_total = 0
             while True:
-                stopping = stop_event is not None and stop_event.is_set()
-                # 填满管道（stop 后不再发新的，只等在途的结算）
-                while not stopping and len(sent_queue) + len(inflight) < pipeline:
+                stopping = ((stop_event is not None and stop_event.is_set())
+                            or (max_requests > 0 and sent_total >= max_requests))
+                # 填满管道（stop/发满配额后不再发新的，只等在途的结算）
+                while (not stopping and len(sent_queue) + len(inflight) < pipeline
+                       and (max_requests == 0 or sent_total < max_requests)):
                     seq = stats.next_seq()
                     _CTX_SEQ.set(seq)
                     await _ws_send(ws, wid, {"type": "input_audio_buffer.append",
                                              "audio": TEST_AUDIO_B64})
                     await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
                     sent_queue.append((seq, time.monotonic()))
+                    sent_total += 1
+                stopping = ((stop_event is not None and stop_event.is_set())
+                            or (max_requests > 0 and sent_total >= max_requests))
                 if stopping and not sent_queue and not inflight:
                     return
 
@@ -1116,7 +1125,7 @@ async def worker_loop(
     stop_event: asyncio.Event, worker_id: int, request_interval: float = 0.0,
     transcribe_model: str = "", language: str = "",
     reuse_conn: bool = False, connect_stagger: float = 0.0,
-    pipeline: int = 1,
+    pipeline: int = 1, burst_share: int = 0,
 ) -> None:
     # 每个 worker 是独立 task，contextvars 互不干扰
     _CTX_BATCH.set(stats.batch_index)
@@ -1126,6 +1135,14 @@ async def worker_loop(
     # (onHandshake 429，连接级)，把握手 429 和模型配额 429 混在一起没法归因
     if connect_stagger > 0 and worker_id > 0:
         await asyncio.sleep(worker_id * connect_stagger)
+    # burst 模式：一口气把份额全部 commit(管道深度=份额)，等全部结算后结束，
+    # 不重连不补发——就是要看"瞬间打 N 个请求"服务端会怎么报错
+    if mode == "transcribe" and burst_share > 0:
+        await run_transcribe_pipelined(stats, deployment, worker_id,
+                                       transcribe_model, language,
+                                       pipeline=burst_share, stop_event=stop_event,
+                                       max_requests=burst_share)
+        return
     idx = worker_id
     while not stop_event.is_set():
         _CTX_SEQ.set(stats.next_seq())   # 批内第几个请求（全 worker 共享递增）
@@ -1185,17 +1202,23 @@ async def run_load_test(
     mode: str, deployment: str, concurrency: int, duration: float,
     request_interval: float = 0.0, transcribe_model: str = "", language: str = "",
     batch_index: int = 1, reuse_conn: bool = False, connect_stagger: float = 0.0,
-    pipeline: int = 1,
+    pipeline: int = 1, burst: int = 0,
 ) -> GlobalStats:
     print(f"\n{_C['bold']}[压测]{_C['reset']} "
           f"第{batch_index}批 mode={mode} deployment={deployment} "
-          f"concurrency={concurrency} duration={duration}s")
+          f"concurrency={concurrency} "
+          f"{f'burst={burst}(发完即止)' if burst > 0 else f'duration={duration}s'}")
     print(f"  endpoint: {build_ws_url(deployment)}")
     if mode == "transcribe":
-        print(f"  transcription model: {transcribe_model}"
-              f"{f'  language={language}' if language else ''}"
-              f"{f'  [管道化: 每连接 {pipeline} 在途，总在途 {concurrency * pipeline}]' if pipeline > 1 else '  [复用连接: 每 worker 一条 WS 循环转写]' if reuse_conn else ''}")
-        if not reuse_conn and pipeline <= 1:
+        if burst > 0:
+            print(f"  transcription model: {transcribe_model}"
+                  f"{f'  language={language}' if language else ''}"
+                  f"  [burst: {concurrency} 条连接一口气发完 {burst} 个 commit，等全部结算]")
+        else:
+            print(f"  transcription model: {transcribe_model}"
+                  f"{f'  language={language}' if language else ''}"
+                  f"{f'  [管道化: 每连接 {pipeline} 在途，总在途 {concurrency * pipeline}]' if pipeline > 1 else '  [复用连接: 每 worker 一条 WS 循环转写]' if reuse_conn else ''}")
+        if not reuse_conn and pipeline <= 1 and burst <= 0:
             print(f"  {_C['yellow']}提示: 未加 --reuse-conn，每次转写都新建 realtime 会话，"
                   f"429 可能来自 realtime 部署而非转写模型{_C['reset']}")
 
@@ -1203,20 +1226,31 @@ async def run_load_test(
     stats.batch_index = batch_index
     stats.batch_concurrency = concurrency
     stop_event = asyncio.Event()
+    # burst: 把总请求数均分给各连接（前 remainder 条多 1 个）
+    def _share(i: int) -> int:
+        if burst <= 0:
+            return 0
+        base, rem = divmod(burst, concurrency)
+        return base + (1 if i < rem else 0)
     workers = [
         asyncio.create_task(
             worker_loop(stats, mode, deployment, stop_event, i, request_interval,
                         transcribe_model, language, reuse_conn, connect_stagger,
-                        pipeline)
+                        pipeline, _share(i))
         )
         for i in range(concurrency)
     ]
     monitor = asyncio.create_task(monitor_loop(stats, stop_event))
 
-    await asyncio.sleep(duration)
-    stop_event.set()
-    for w in workers:
-        w.cancel()
+    if burst > 0:
+        # burst 模式：发完即止，等所有 worker 把在途结算完自然结束
+        await asyncio.gather(*workers, return_exceptions=True)
+        stop_event.set()
+    else:
+        await asyncio.sleep(duration)
+        stop_event.set()
+        for w in workers:
+            w.cancel()
     monitor.cancel()
     await asyncio.gather(*workers, monitor, return_exceptions=True)
     return stats
@@ -1306,6 +1340,11 @@ def parse_args() -> argparse.Namespace:
                         ">1 时不等上一个转写完成就连发 commit(隐含复用连接)，"
                         "总在途=并发×管道，才能真正打满转写模型配额。"
                         "如 --concurrency 10 --pipeline 10 = 100 在途，只需 10 次握手")
+    p.add_argument("--burst", type=int, default=0,
+                   help="burst 脉冲模式(仅 transcribe)：N 个转写请求按 --concurrency 均分，"
+                        "每条连接一口气全部 commit，等全部结算后结束(忽略 --duration)。"
+                        "如 --burst 1000 --concurrency 10 = 每连接瞬间灌 100 个在途，"
+                        "看服务端在什么量级开始报什么错")
     p.add_argument("--connect-stagger", type=float, default=0.25,
                    help="worker 首次握手错峰间隔(秒/个)，默认 0.25。避免一批 worker "
                         "同时握手撞 S0 tier 连接建立速率(onHandshake 429)，把连接级 "
@@ -1346,6 +1385,12 @@ def main() -> None:
     if args.mode == "transcribe" and not args.transcribe_model:
         print("错误: transcribe 模式需要 --transcribe-model 或 WHISPER_DEPLOYMENT")
         sys.exit(1)
+    if args.burst > 0 and args.mode != "transcribe":
+        print("错误: --burst 仅支持 transcribe 模式")
+        sys.exit(1)
+    if args.burst > 0 and args.ramp:
+        print("错误: --burst 与 --ramp 不能同时使用")
+        sys.exit(1)
 
     LOG = EventLog(verbose=args.verbose)
     test_start_utc = datetime.now(timezone.utc).isoformat()
@@ -1378,6 +1423,7 @@ def main() -> None:
                     reuse_conn=args.reuse_conn,
                     connect_stagger=args.connect_stagger,
                     pipeline=args.pipeline,
+                    burst=args.burst,
                 )
             )
             s = stats.summary()
@@ -1406,6 +1452,7 @@ def main() -> None:
                 "reuse_conn":      args.reuse_conn,
                 "connect_stagger": args.connect_stagger,
                 "pipeline":        args.pipeline,
+                "burst":           args.burst,
                 "region":          args.region,
                 "mode":            args.mode,
                 "concurrency":     args.concurrency,
@@ -1590,6 +1637,7 @@ const metaFields = [
   ...(META.transcribe_model ? [["转写模型", META.transcribe_model]] : []),
   ...(META.mode === "transcribe" ? [["复用连接", (META.pipeline>1 || META.reuse_conn) ? "是" : "否(429或含握手限流)"]] : []),
   ...(META.pipeline > 1 ? [["管道深度", META.pipeline + "/连接 (总在途 " + (META.pipeline * META.concurrency) + ")"]] : []),
+  ...(META.burst > 0 ? [["burst", META.burst + " 个一次发完"]] : []),
   ...(META.connect_stagger ? [["握手错峰", META.connect_stagger + "s/个"]] : []),
   ["并发",     META.concurrency],
   ["时长",     META.duration_s + "s"],
