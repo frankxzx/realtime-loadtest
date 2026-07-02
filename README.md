@@ -95,6 +95,31 @@ python3 realtime_loadtest.py --mode chat --concurrency 100 --sync-fire --html
 - **`--sync-fire`（齐射）**：worker 仍按 `--connect-stagger` 错峰握手（避开 `onHandshake` 429 干扰归因），全部注好历史后集合，**同一时刻**齐发 `response.create`，打完这一轮即止（忽略 `--duration`）。用来回答"**同一时间戳打 100 个并发请求，模型配额会怎样**"。控制台会打出开火时刻与就绪路数（`⚡ 同步开火: 100/100 路就绪 @ <UTC时间戳>`），齐射的延迟从开火时刻起算
 - 不加 `--sync-fire`：持续模式，每 worker 循环整段话本直到 `--duration` 到点，会话结束自动重连开新会话
 
+### 1006 随机断连排查（chat 模式）
+
+生产上 WebSocket 挂 1006（异常断连：没收到 close frame，TCP 被直接掐）且**时间点随机、阶段随机**（可能第 5 分钟、第 7 分钟；可能正在生成、也可能刚发完话术）时，用长电话 soak 做**统计型重现 + 取证**：
+
+```bash
+# 100 路整通长电话（同一条 WS 不重连），每轮回复后静默 45s 模拟坐席讲话，跑 30 分钟
+python3 realtime_loadtest.py --mode chat --concurrency 100 --session-loop \
+  --turn-gap 45 --duration 1800 --html
+```
+
+- `--session-loop`：同一条 WS 循环话本直到 duration，不主动断开——单连接存活十几分钟，才够得着「第 5/7 分钟随机断」的窗口；断了会自动重连继续攒时长
+- `--turn-gap N`：每轮回复后静默 N 秒（坐席讲话中，WS 完全空闲只剩 keepalive ping），复刻真实通话的「说完刚发送/空闲」窗口
+
+**断连取证（自动）**：每次中途断连记录 close code（没收到 close frame 即 1006）、**断连时所处阶段**（`send_turn` 刚发完话术 / `awaiting_response` 正在生成 / `idle_gap` 静默中）、**连接存活时长**、最近一次 keepalive RTT。汇总输出怎么读：
+
+| 证据 | 怎么读 |
+|---|---|
+| `abnormal_close_by_code` | 断连按 close code 分布；全是 1006 = 被硬掐，出现 1011/1001 = 服务端体面关闭 |
+| **同时刻断连成簇检测**（2s 窗口） | **成簇（N 路同秒死）= 服务端/网关侧事件**（节点回收、扩缩容、负载丢弃）；**随机分散 = 单连接层面**（网络路径、keepalive） |
+| 连接存活时长分布 | 集中在固定值（如 ~240s / ~30min）= 空闲超时或会话寿命；随机 = 容量/基础设施 |
+| `abnormal_per_conn_hour` | 断连率按「连接·小时」归一化，**直接和生产断连率对比**，判断是否复现了同一量级 |
+| 事件循环滞后探针 | monitor 每 5s 测压测机 loop lag，>200ms 告警——lag 大时 pong 回不及时，1006 可能是压测机自伤，别甩锅服务端 |
+
+排查 keepalive 假设可调 `--ping-interval` / `--ping-timeout`（默认 20/20s；`--ping-interval 0` 禁用客户端 ping，看纯靠服务端 ping 会不会被掐）。
+
 ## 429 与所有异常来源（重要）
 
 Realtime API 是 WebSocket，**429 不是单一的 HTTP 报错**——取决于什么时候撞限流，会以不同形式出现（已对照 [Azure 官方文档](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio-websockets) 与 [OpenAI Realtime 规范](https://developers.openai.com/api/docs/guides/realtime) 核实）：
@@ -178,6 +203,10 @@ python3 realtime_loadtest.py \
 |---|---|---|
 | `--mode` | `text` | `text` / `audio` / `transcribe` / `chat`（保险坐席对话场景，AI 扮演客户） |
 | `--sync-fire` | 关 | 仅 `chat` 模式：全员建连+注入历史后**同一时刻**齐发一轮 `response.create`，打完即止（忽略 `--duration`） |
+| `--session-loop` | 关 | 仅 `chat` 模式：同一条 WS 循环话本到 `--duration` 不重连（整通长电话），钓随机断连（1006） |
+| `--turn-gap` | `0` | 仅 `chat` 模式：每轮回复后静默秒数（坐席讲话中 WS 完全空闲），真实通话形态建议 30~60 |
+| `--ping-interval` | `20` | `chat` 模式 WS keepalive ping 间隔秒，`0` 禁用客户端 ping |
+| `--ping-timeout` | `20` | `chat` 模式等 pong 超时秒，超时客户端按 keepalive 失败断开 |
 | `--deployment` | `$REALTIME_DEPLOYMENT` | realtime 部署名（WS 连接用） |
 | `--transcribe-model` | `$WHISPER_DEPLOYMENT` | 转写模型部署名（仅 `transcribe` 模式） |
 | `--language` | — | 转写语言 ISO-639-1（仅 `transcribe` 模式，留空自动检测） |
