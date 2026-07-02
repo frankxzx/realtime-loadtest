@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Azure OpenAI Realtime API 压测脚本 (GA)
-测试 gpt-realtime-1.5 + gpt-realtime-whisper 的 TPM/RPM 上限
+测试 gpt-realtime-1.5 + gpt-realtime-whisper 的 RPM/TPM/并发上限
 
 用法:
   cp .env.example .env && vi .env
@@ -10,9 +10,26 @@ Azure OpenAI Realtime API 压测脚本 (GA)
   python3 realtime_loadtest.py --mode audio --concurrency 5 --duration 60 --html
   python3 realtime_loadtest.py --mode text --ramp --ramp-start 1 --ramp-max 50 --ramp-step 5 --html
 
+  # 转写(whisper)持续压测：--pipeline 管道化，总在途=并发×管道，只握手 10 次
+  python3 realtime_loadtest.py --mode transcribe --transcribe-model gpt-realtime-whisper \\
+      --language en --concurrency 10 --pipeline 10 --duration 120 --html
+
+  # 转写脉冲测试：1000 个 commit 一次性发完，看什么量级报什么错(忽略 duration)
+  python3 realtime_loadtest.py --mode transcribe --transcribe-model gpt-realtime-whisper \\
+      --language en --burst 1000 --concurrency 10 --html
+
   # 带期望配额对比（拿去跟 Azure 对峙用）
   python3 realtime_loadtest.py --mode text --concurrency 20 --duration 120 \\
       --expected-tpm 50000 --expected-rpm 100 --region eastus2 --html
+
+transcribe 模式关键参数:
+  --reuse-conn        复用 WS：每 worker 一次握手，同连接循环转写(串行，每连接 1 在途)
+  --pipeline N        管道化(隐含复用)：不等 completed 连发 N 个 commit，按 item_id 对账
+  --burst N           脉冲：N 个请求均分到各连接一口气发完，等全部结算即止(与 --ramp 互斥)
+  --connect-stagger   worker 首连错峰秒数(默认 0.25)，防同时握手撞 S0 onHandshake 429
+
+429 归因: 报告区分 handshake(连接级,S0 tier 握手限流,非模型配额) / session(模型配额)。
+whisper 按音频时长计费(usage.type=="duration"，无 token)：看 RPM 和转写速率(s/min)，TPM 恒 0。
 """
 
 import asyncio

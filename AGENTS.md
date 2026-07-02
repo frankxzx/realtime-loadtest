@@ -21,6 +21,8 @@ git add -A && git commit -m "..." && git push
 
 - **直接在这里改 → commit → push**，没有 cp/同步步骤。
 - 约定：**改完自动 push，不用问用户**。
+- 约定：**新增/修改 CLI 参数时，同一 commit 里更新 `realtime_loadtest.py` 顶部
+  docstring**（用法示例+参数说明），README 参数表和本文件也别漏。
 - 依赖极少：`pip install websockets`（音频用自带 `hello_world.wav`，不需要 ffmpeg）。
 
 ## 怎么跑
