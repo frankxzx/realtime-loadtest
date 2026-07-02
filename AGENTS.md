@@ -87,7 +87,13 @@ WS URL：`wss://{endpoint}/openai/v1/realtime?model={realtime部署名}`（trans
 
 ## 异常/429 模型（6 类，别漏）
 
-429 不是单一 HTTP 错误，取决于何时撞限流：
+429 不是单一 HTTP 错误，取决于何时撞限流。**429 按来源分两类，归因完全不同**：
+- **握手 429（`source="handshake"`）**：WS 握手被拒 → `InvalidStatus`，错误信息带
+  `onHandshake Operation`，是 **S0 tier 连接建立速率限制**，跟模型/转写配额无关。
+  缓解：`--reuse-conn` + `--connect-stagger`（默认 0.25s/个错峰）。
+- **会话内 429（`source="session"`）**：`error` 事件 / `transcription.failed` 限流，
+  这才是模型（whisper）配额被打满的证据。
+明细：
 - **HTTP 429**：WS 握手被拒 → `InvalidStatus`（连接级）
 - **`error` 事件**：会话中报错（JSON，非 HTTP）
 - **`response.done` status=failed**：`status_details.error`（曾被误当成功，已修）

@@ -229,6 +229,10 @@ class GlobalStats:
     success:             int   = 0
     failed:              int   = 0
     rate_limited_429:    int   = 0
+    # 429 按来源拆分：handshake=WS 握手被拒(连接级，S0 tier 新建连接速率，跟转写模型无关)
+    #                 session=会话内事件(transcription.failed/error，才是模型配额)
+    rate_limited_handshake: int = 0
+    rate_limited_session:   int = 0
     transcription_failed: int  = 0
     response_failed:     int   = 0
     timeouts:            int   = 0
@@ -293,13 +297,20 @@ class GlobalStats:
             for _ in range(input_tok + output_tok):
                 self.token_timestamps.append(now)
 
-    async def record_rate_limit(self, message: str, code: str = "", retry_after: str = ""):
+    async def record_rate_limit(self, message: str, code: str = "", retry_after: str = "",
+                                source: str = "session"):
+        """source: "handshake"=WS 握手 HTTP 429（连接级，非模型配额）
+                   "session"=会话内限流事件（真正命中模型/转写配额）"""
         async with self.lock:
             now = time.monotonic()
             elapsed = now - self.start_time
             self.total_requests += 1
             self.failed += 1
             self.rate_limited_429 += 1
+            if source == "handshake":
+                self.rate_limited_handshake += 1
+            else:
+                self.rate_limited_session += 1
             self.req_timestamps.append(now)
 
             rpm = self._rpm_unlocked()
@@ -317,14 +328,15 @@ class GlobalStats:
                 "batch_cc":    cc,
                 "seq":         s,
                 "worker":      w,
+                "source":      source,
                 "code":        code,
                 "message":     message[:300],
                 "retry_after": retry_after,
                 "rpm":         rpm,
                 "tpm":         tpm,
             })
-            self.errors.append(f"[B{b}#{s} 429:{code}] {message[:100]}")
-            self._mark_first_anomaly_unlocked("429", f"[{code}] {message}", elapsed)
+            self.errors.append(f"[B{b}#{s} 429/{source}:{code}] {message[:100]}")
+            self._mark_first_anomaly_unlocked(f"429_{source}", f"[{code}] {message}", elapsed)
 
     async def record_failure(self, reason: str):
         async with self.lock:
@@ -449,6 +461,8 @@ class GlobalStats:
             "success_rate_pct":   ok_rate,
             "failed":             self.failed,
             "rate_limited_429":   self.rate_limited_429,
+            "rate_limited_handshake": self.rate_limited_handshake,
+            "rate_limited_session":   self.rate_limited_session,
             "transcription_failed": self.transcription_failed,
             "response_failed":    self.response_failed,
             "timeouts":           self.timeouts,
@@ -740,15 +754,15 @@ async def run_text_session(
 
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
-        await stats.record_rate_limit(str(e), e.code, e.retry_after)
+        await stats.record_rate_limit(str(e), e.code, e.retry_after, source="session")
     except ResponseFailed as e:
         LOG.error(wid, f"response.{e.status}", f"[{e.code}] {e}")
         await stats.record_response_failure(str(e), e.code, e.status)
     except InvalidStatus as e:
         is_429, code, msg, retry_after = _parse_invalid_status(e)
         if is_429:
-            LOG.rate_limit(wid, f"[{code}] {msg} retry_after={retry_after}")
-            await stats.record_rate_limit(msg, code, retry_after)
+            LOG.rate_limit(wid, f"[握手429/连接级] [{code}] {msg} retry_after={retry_after}")
+            await stats.record_rate_limit(msg, code, retry_after, source="handshake")
         else:
             LOG.error(wid, f"HTTP {e.response.status_code}", msg, e)
             await stats.record_failure(msg)
@@ -812,15 +826,15 @@ async def run_audio_session(
 
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
-        await stats.record_rate_limit(str(e), e.code, e.retry_after)
+        await stats.record_rate_limit(str(e), e.code, e.retry_after, source="session")
     except ResponseFailed as e:
         LOG.error(wid, f"response.{e.status}", f"[{e.code}] {e}")
         await stats.record_response_failure(str(e), e.code, e.status)
     except InvalidStatus as e:
         is_429, code, msg, retry_after = _parse_invalid_status(e)
         if is_429:
-            LOG.rate_limit(wid, f"[{code}] {msg} retry_after={retry_after}")
-            await stats.record_rate_limit(msg, code, retry_after)
+            LOG.rate_limit(wid, f"[握手429/连接级] [{code}] {msg} retry_after={retry_after}")
+            await stats.record_rate_limit(msg, code, retry_after, source="handshake")
         else:
             LOG.error(wid, f"HTTP {e.response.status_code}", msg, e)
             await stats.record_failure(msg)
@@ -900,7 +914,7 @@ async def run_transcribe_session(
                     # 转写级限流（transcription.failed / error 事件）：会话还活着，
                     # 复用模式下记录后继续压——这正是我们要测的 whisper 429
                     LOG.rate_limit(wid, f"[{e.code}] {e}")
-                    await stats.record_rate_limit(str(e), e.code, e.retry_after)
+                    await stats.record_rate_limit(str(e), e.code, e.retry_after, source="session")
                     if not reuse:
                         return
                 except TranscriptionFailed as e:
@@ -916,15 +930,15 @@ async def run_transcribe_session(
 
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
-        await stats.record_rate_limit(str(e), e.code, e.retry_after)
+        await stats.record_rate_limit(str(e), e.code, e.retry_after, source="session")
     except TranscriptionFailed as e:
         LOG.error(wid, "transcription.failed", f"[{e.code}] {e}")
         await stats.record_transcription_failure(str(e), e.code)
     except InvalidStatus as e:
         is_429, code, msg, retry_after = _parse_invalid_status(e)
         if is_429:
-            LOG.rate_limit(wid, f"[{code}] {msg} retry_after={retry_after}")
-            await stats.record_rate_limit(msg, code, retry_after)
+            LOG.rate_limit(wid, f"[握手429/连接级] [{code}] {msg} retry_after={retry_after}")
+            await stats.record_rate_limit(msg, code, retry_after, source="handshake")
         else:
             LOG.error(wid, f"HTTP {e.response.status_code}", msg, e)
             await stats.record_failure(msg)
@@ -941,12 +955,16 @@ async def worker_loop(
     stats: GlobalStats, mode: str, deployment: str,
     stop_event: asyncio.Event, worker_id: int, request_interval: float = 0.0,
     transcribe_model: str = "", language: str = "",
-    reuse_conn: bool = False,
+    reuse_conn: bool = False, connect_stagger: float = 0.0,
 ) -> None:
     # 每个 worker 是独立 task，contextvars 互不干扰
     _CTX_BATCH.set(stats.batch_index)
     _CTX_BATCH_CC.set(stats.batch_concurrency)
     _CTX_WORKER.set(f"W{worker_id:02d}")
+    # 启动错峰：避免一批 worker 同时握手撞上 S0 tier 的连接建立速率限制
+    # (onHandshake 429，连接级)，把握手 429 和模型配额 429 混在一起没法归因
+    if connect_stagger > 0 and worker_id > 0:
+        await asyncio.sleep(worker_id * connect_stagger)
     idx = worker_id
     while not stop_event.is_set():
         _CTX_SEQ.set(stats.next_seq())   # 批内第几个请求（全 worker 共享递增）
@@ -1000,7 +1018,7 @@ async def monitor_loop(
 async def run_load_test(
     mode: str, deployment: str, concurrency: int, duration: float,
     request_interval: float = 0.0, transcribe_model: str = "", language: str = "",
-    batch_index: int = 1, reuse_conn: bool = False,
+    batch_index: int = 1, reuse_conn: bool = False, connect_stagger: float = 0.0,
 ) -> GlobalStats:
     print(f"\n{_C['bold']}[压测]{_C['reset']} "
           f"第{batch_index}批 mode={mode} deployment={deployment} "
@@ -1021,7 +1039,7 @@ async def run_load_test(
     workers = [
         asyncio.create_task(
             worker_loop(stats, mode, deployment, stop_event, i, request_interval,
-                        transcribe_model, language, reuse_conn)
+                        transcribe_model, language, reuse_conn, connect_stagger)
         )
         for i in range(concurrency)
     ]
@@ -1040,7 +1058,7 @@ async def run_ramp_test(
     mode: str, deployment: str,
     ramp_start: int, ramp_max: int, ramp_step: int, step_duration: float,
     transcribe_model: str = "", language: str = "",
-    reuse_conn: bool = False,
+    reuse_conn: bool = False, connect_stagger: float = 0.0,
 ) -> tuple[list[dict], GlobalStats | None]:
     print(f"\n[Ramp] {ramp_start}→{ramp_max} 并发，每步 {step_duration}s")
     results = []
@@ -1053,17 +1071,23 @@ async def run_ramp_test(
         print(f"\n{'='*50}\n>>> 第 {batch_no} 批  并发: {concurrency}")
         stats = await run_load_test(mode, deployment, concurrency, step_duration,
                                     0.0, transcribe_model, language,
-                                    batch_index=batch_no, reuse_conn=reuse_conn)
+                                    batch_index=batch_no, reuse_conn=reuse_conn,
+                                    connect_stagger=connect_stagger)
         last_stats = stats
         s = stats.summary()
         s["concurrency"] = concurrency
         s["batch"] = batch_no
         results.append(s)
         print(f"  RPM={s['avg_rpm']}  TPM={s['avg_tpm']}  "
-              f"429s={s['rate_limited_429']}  P95={s['latency_p95_ms']}ms")
+              f"429s={s['rate_limited_429']}"
+              f"(握手{s['rate_limited_handshake']}/会话{s['rate_limited_session']})"
+              f"  P95={s['latency_p95_ms']}ms")
 
         if s["rate_limited_429"] > 0:
-            print(f"\n{_C['yellow']}!!! 并发={concurrency} 触发 429，"
+            attribution = ("模型/转写配额" if s["rate_limited_session"] > 0
+                           else "连接级握手限流(非模型配额, 提高 --connect-stagger 或换 tier)")
+            print(f"\n{_C['yellow']}!!! 并发={concurrency} 触发 429 "
+                  f"[归属: {attribution}]，"
                   f"上一个稳定并发: {concurrency - ramp_step}{_C['reset']}")
             break
         concurrency += ramp_step
@@ -1108,6 +1132,10 @@ def parse_args() -> argparse.Namespace:
                    help="transcribe 模式复用 WS 连接：每 worker 建一次 realtime 会话，"
                         "在同一连接上循环 commit 转写。测 whisper 上限必开，否则 429 "
                         "会先撞 realtime 部署的会话创建限流")
+    p.add_argument("--connect-stagger", type=float, default=0.25,
+                   help="worker 首次握手错峰间隔(秒/个)，默认 0.25。避免一批 worker "
+                        "同时握手撞 S0 tier 连接建立速率(onHandshake 429)，把连接级 "
+                        "429 和模型配额 429 混在一起。设 0 关闭(测握手上限时用)")
     p.add_argument("--concurrency", type=int,   default=5)
     p.add_argument("--duration",    type=float, default=60.0)
     p.add_argument("--interval",    type=float, default=0.0)
@@ -1163,6 +1191,7 @@ def main() -> None:
                     args.ramp_step, args.ramp_step_duration,
                     args.transcribe_model, args.language,
                     reuse_conn=args.reuse_conn,
+                    connect_stagger=args.connect_stagger,
                 )
             )
         else:
@@ -1172,6 +1201,7 @@ def main() -> None:
                     args.concurrency, args.duration, args.interval,
                     args.transcribe_model, args.language,
                     reuse_conn=args.reuse_conn,
+                    connect_stagger=args.connect_stagger,
                 )
             )
             s = stats.summary()
@@ -1198,6 +1228,7 @@ def main() -> None:
                 "deployment":      args.deployment,
                 "transcribe_model": args.transcribe_model if args.mode == "transcribe" else "",
                 "reuse_conn":      args.reuse_conn,
+                "connect_stagger": args.connect_stagger,
                 "region":          args.region,
                 "mode":            args.mode,
                 "concurrency":     args.concurrency,
@@ -1324,7 +1355,7 @@ td.evt{width:220px;white-space:nowrap}
   <h2>429 限流详情</h2>
   <table id="rl-table">
     <thead><tr>
-      <th>+时间(s)</th><th>批</th><th>#序号</th><th>Worker</th>
+      <th>+时间(s)</th><th>批</th><th>#序号</th><th>Worker</th><th>来源</th>
       <th>RPM@事件</th><th>TPM@事件</th>
       <th>错误码</th><th>Retry-After</th><th>错误信息</th>
     </tr></thead>
@@ -1380,6 +1411,8 @@ const metaFields = [
   ["区域",     META.region || "—"],
   ["模式",     META.mode],
   ...(META.transcribe_model ? [["转写模型", META.transcribe_model]] : []),
+  ...(META.mode === "transcribe" ? [["复用连接", META.reuse_conn ? "是" : "否(429或含握手限流)"]] : []),
+  ...(META.connect_stagger ? [["握手错峰", META.connect_stagger + "s/个"]] : []),
   ["并发",     META.concurrency],
   ["时长",     META.duration_s + "s"],
   ["期望TPM",  META.expected_tpm || "—"],
@@ -1412,7 +1445,11 @@ const cards = [
   {label:"成功率",     value: ok_rate+"%",                              sub:`成功 ${(SUM.success||0).toLocaleString()} 次`, cls: ok_rate>=95?"good":ok_rate>=80?"warn":"danger"},
   {label:"峰值 RPM",   value: peak_rpm.toLocaleString(),               sub: quotaLine(peak_rpm, quota_rpm, "RPM"),    cls: quota_rpm&&peak_rpm<quota_rpm*0.7?"danger":""},
   {label:"峰值 TPM",   value: peak_tpm.toLocaleString(),               sub: quotaLine(peak_tpm, quota_tpm, "TPM"),    cls: quota_tpm&&peak_tpm<quota_tpm*0.7?"danger":""},
-  {label:"429 次数",   value: (SUM.rate_limited_429||0).toLocaleString(), sub: f429!=null?`首次 +${f429}s`:"未触发", cls: SUM.rate_limited_429>0?"danger":"good"},
+  {label:"429 次数",   value: (SUM.rate_limited_429||0).toLocaleString(),
+   sub: SUM.rate_limited_429>0
+     ? `握手(连接级) ${SUM.rate_limited_handshake||0} · 会话内(模型配额) ${SUM.rate_limited_session||0}${f429!=null?` · 首次 +${f429}s`:""}`
+     : "未触发",
+   cls: SUM.rate_limited_429>0?"danger":"good"},
   {label:"首次异常(第几批第几个)", value: faText,                        sub: faSub,  cls: FA?"danger":"good"},
   {label:"首次限流时",  value: f429!=null?"+"+f429+"s":"—",            sub: f429!=null?`RPM=${SUM.first_429_rpm} TPM=${SUM.first_429_tpm}`:"",  cls: f429!=null?"danger":""},
   {label:"P95 延迟",   value: (SUM.latency_p95_ms||0)+"ms",           sub:`P99=${SUM.latency_p99_ms||0}ms Max=${SUM.latency_max_ms||0}ms`, cls:""},
@@ -1427,13 +1464,16 @@ document.getElementById("cards").innerHTML = cards.map(c =>
 
 // ── 异常分类 chips ────────────────────────────────────────────────────────────
 const e429   = SUM.rate_limited_429 || 0;
+const e429hs = SUM.rate_limited_handshake || 0;
+const e429ss = SUM.rate_limited_session || 0;
 const eTrans = SUM.transcription_failed || 0;
 const eResp  = SUM.response_failed || 0;
 const eTimeout = SUM.timeouts || 0;
 const eConn  = SUM.connection_errors || 0;
 const eOther = Math.max(0, (SUM.failed||0) - e429 - eTrans - eResp - eTimeout);
 const chips = [
-  {lbl:"429 限流",       n:e429,    color:"#f85149"},
+  {lbl:"429 握手(连接级)",   n:e429hs, color:"#f85149"},
+  {lbl:"429 会话内(模型配额)", n:e429ss, color:"#ff7b72"},
   {lbl:"转写失败",       n:eTrans,  color:"#db6d28"},
   {lbl:"response失败",   n:eResp,   color:"#f0883e"},
   {lbl:"超时",           n:eTimeout,color:"#d29922"},
@@ -1481,6 +1521,9 @@ if (RL.length > 0) {
       <td style="color:#58a6ff">B${r.batch||"?"}</td>
       <td style="color:#d29922">#${r.seq||"?"}</td>
       <td>${esc(r.worker||"—")}</td>
+      <td>${r.source==="handshake"
+            ? '<span style="color:#bc8cff">握手/连接级</span>'
+            : '<span style="color:#f85149">会话内/模型配额</span>'}</td>
       <td>${r.rpm}</td><td>${r.tpm}</td>
       <td style="color:#f85149">${esc(r.code)}</td>
       <td>${esc(r.retry_after||"—")}</td>
@@ -1652,9 +1695,9 @@ function exportCSV(){
     lines.push([FA.batch,FA.batch_cc,FA.seq,FA.worker,FA.kind,FA.elapsed].join(","));
   }
   // 也附上 429 详情
-  lines.push("","# 429 详情","elapsed,batch,seq,worker,code,message,retry_after,rpm,tpm");
+  lines.push("","# 429 详情","elapsed,batch,seq,worker,source,code,message,retry_after,rpm,tpm");
   RL.forEach(r=>{
-    lines.push([r.elapsed,r.batch,r.seq,r.worker,r.code,'"'+r.message.replace(/"/g,'""')+'"',r.retry_after,r.rpm,r.tpm].join(","));
+    lines.push([r.elapsed,r.batch,r.seq,r.worker,r.source||"",r.code,'"'+r.message.replace(/"/g,'""')+'"',r.retry_after,r.rpm,r.tpm].join(","));
   });
   // 时序数据
   lines.push("","# 时序","elapsed,rpm,tpm,ok,e429,err");
