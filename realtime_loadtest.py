@@ -643,6 +643,25 @@ async def _wait_response_done(ws, worker: str, timeout: float, stats=None) -> tu
             _raise_ws_error(evt)
 
 
+def _parse_transcription_usage(worker: str, evt: dict) -> tuple[int, int, str]:
+    """从 transcription.completed 事件解析 (in_tok, out_tok, transcript)"""
+    usage   = evt.get("usage", {}) or {}
+    details = usage.get("input_token_details", {}) or {}
+    in_tok  = usage.get("input_tokens", 0)
+    out_tok = usage.get("output_tokens", 0)
+    # 兜底1: 顶层 input_tokens 缺失时，用 audio+text 明细求和
+    if not in_tok and details:
+        in_tok = details.get("audio_tokens", 0) + details.get("text_tokens", 0)
+    # 兜底2: 仍拿到 total 但拆不出，用 total 当 in
+    if not in_tok and usage.get("total_tokens"):
+        in_tok = usage["total_tokens"] - out_tok
+    # 诊断: usage 缺失/全 0 时把原始事件打出来（whisper-1 按时长计费则 usage.type=="duration"）
+    if not usage or (in_tok == 0 and out_tok == 0):
+        LOG.warn(worker, "transcription usage 缺失/为0",
+                 json.dumps({k: v for k, v in evt.items() if k != "logprobs"})[:300])
+    return in_tok, out_tok, evt.get("transcript", "")
+
+
 async def _wait_transcription_completed(ws, worker: str, timeout: float,
                                         stats=None) -> tuple[int, int, str]:
     """等待 conversation.item.input_audio_transcription.completed，返回 (in_tok, out_tok, transcript)"""
@@ -659,21 +678,7 @@ async def _wait_transcription_completed(ws, worker: str, timeout: float,
             await _capture_rate_limits(stats, worker, evt)
             continue
         if t == "conversation.item.input_audio_transcription.completed":
-            usage   = evt.get("usage", {}) or {}
-            details = usage.get("input_token_details", {}) or {}
-            in_tok  = usage.get("input_tokens", 0)
-            out_tok = usage.get("output_tokens", 0)
-            # 兜底1: 顶层 input_tokens 缺失时，用 audio+text 明细求和
-            if not in_tok and details:
-                in_tok = details.get("audio_tokens", 0) + details.get("text_tokens", 0)
-            # 兜底2: 仍拿到 total 但拆不出，用 total 当 in
-            if not in_tok and usage.get("total_tokens"):
-                in_tok = usage["total_tokens"] - out_tok
-            # 诊断: usage 缺失/全 0 时把原始事件打出来（whisper-1 按时长计费则 usage.type=="duration"）
-            if not usage or (in_tok == 0 and out_tok == 0):
-                LOG.warn(worker, "transcription usage 缺失/为0",
-                         json.dumps({k: v for k, v in evt.items() if k != "logprobs"})[:300])
-            return in_tok, out_tok, evt.get("transcript", "")
+            return _parse_transcription_usage(worker, evt)
         if t == "conversation.item.input_audio_transcription.failed":
             _handle_transcription_failed(worker, evt, fatal=True)  # 转写模式里是致命
         if t == "error":
@@ -950,12 +955,141 @@ async def run_transcribe_session(
         await stats.record_connection_error(str(e))
 
 
+# ─── 单次会话：转写管道化（一条连接多个在途 commit，打满转写模型）───────────────
+async def run_transcribe_pipelined(
+    stats: GlobalStats, deployment: str, worker_id: int,
+    transcribe_model: str, language: str = "", timeout: float = 45.0,
+    pipeline: int = 8, stop_event: asyncio.Event | None = None,
+) -> None:
+    """
+    管道化转写：不等上一个转写完成就连续 append→commit，保持每条连接
+    `pipeline` 个在途转写。commit 是异步的——每次 commit 生成独立 conversation
+    item 并触发独立转写；官方文档明确"完成事件顺序不保证，用 item_id 匹配"，
+    即服务端并行处理多个在途转写。
+    总在途 = concurrency × pipeline，这才是打满转写模型配额的压力形态；
+    串行模式(run_transcribe_session)每连接同时只有 1 个在途，吞吐被单次
+    转写延迟(~4.5s)限死。
+    配对：input_audio_buffer.committed 的 item_id 按 FIFO 对应 commit 顺序，
+    completed/failed 按 item_id 结算 latency 与 seq 归属。
+    """
+    wid = f"W{worker_id:02d}"
+    transcription: dict = {"model": transcribe_model}
+    if language:
+        transcription["language"] = language
+    sent_queue: deque = deque()   # 已 commit 待配 item_id: (seq, t_sent)
+    inflight:   dict  = {}        # item_id -> (seq, t_sent)
+
+    def _settle(item_id: str):
+        """按 item_id 找回 (seq, t_sent)；配不上则 FIFO 兜底"""
+        if item_id in inflight:
+            return inflight.pop(item_id)
+        if sent_queue:
+            return sent_queue.popleft()
+        return (_CTX_SEQ.get(), time.monotonic())
+
+    try:
+        async with websockets.connect(
+            build_ws_url(deployment),
+            additional_headers={"api-key": API_KEY},
+            open_timeout=10, close_timeout=5, ssl=_SSL_CTX,
+        ) as ws:
+            LOG.info(wid, "connected", f"pipeline={pipeline}")
+            await _wait_event(ws, wid, "session.created", timeout=10)
+            await _ws_send(ws, wid, {
+                "type": "session.update",
+                "session": {
+                    "type": "realtime",
+                    "output_modalities": ["text"],
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "noise_reduction": {"type": "far_field"},
+                            "transcription": transcription,
+                            "turn_detection": None,
+                        },
+                    },
+                },
+            })
+            await _wait_event(ws, wid, "session.updated", timeout=10)
+
+            while True:
+                stopping = stop_event is not None and stop_event.is_set()
+                # 填满管道（stop 后不再发新的，只等在途的结算）
+                while not stopping and len(sent_queue) + len(inflight) < pipeline:
+                    seq = stats.next_seq()
+                    _CTX_SEQ.set(seq)
+                    await _ws_send(ws, wid, {"type": "input_audio_buffer.append",
+                                             "audio": TEST_AUDIO_B64})
+                    await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
+                    sent_queue.append((seq, time.monotonic()))
+                if stopping and not sent_queue and not inflight:
+                    return
+
+                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                evt = json.loads(raw)
+                t = evt.get("type", "")
+                LOG.recv(wid, t, {k: v for k, v in evt.items() if k not in ("type", "delta")})
+
+                if t == "input_audio_buffer.committed":
+                    # committed 顺序 == commit 发送顺序，FIFO 配 item_id
+                    item_id = evt.get("item_id", "")
+                    if item_id and sent_queue:
+                        inflight[item_id] = sent_queue.popleft()
+                elif t == "conversation.item.input_audio_transcription.completed":
+                    seq, t_sent = _settle(evt.get("item_id", ""))
+                    _CTX_SEQ.set(seq)
+                    latency = time.monotonic() - t_sent
+                    in_tok, out_tok, transcript = _parse_transcription_usage(wid, evt)
+                    LOG.success(wid, "transcription.completed",
+                                f'in={in_tok} out={out_tok} lat={latency:.2f}s '
+                                f'inflight={len(inflight)+len(sent_queue)} "{transcript[:30]}"')
+                    await stats.record_success(in_tok, out_tok, latency)
+                elif t == "conversation.item.input_audio_transcription.failed":
+                    seq, _ = _settle((evt.get("item_id") or ""))
+                    _CTX_SEQ.set(seq)
+                    try:
+                        _handle_transcription_failed(wid, evt, fatal=True)
+                    except RateLimitError as e:   # 转写限流：模型配额 429，记录后继续压
+                        await stats.record_rate_limit(str(e), e.code, e.retry_after,
+                                                      source="session")
+                    except TranscriptionFailed as e:
+                        await stats.record_transcription_failure(str(e), e.code)
+                elif t == "rate_limits.updated":
+                    await _capture_rate_limits(stats, wid, evt)
+                elif t == "error":
+                    try:
+                        _raise_ws_error(evt)
+                    except RateLimitError as e:   # 会话级限流：记录后继续（连接还活着）
+                        LOG.rate_limit(wid, f"[{e.code}] {e}")
+                        await stats.record_rate_limit(str(e), e.code, e.retry_after,
+                                                      source="session")
+
+    except InvalidStatus as e:
+        is_429, code, msg, retry_after = _parse_invalid_status(e)
+        if is_429:
+            LOG.rate_limit(wid, f"[握手429/连接级] [{code}] {msg} retry_after={retry_after}")
+            await stats.record_rate_limit(msg, code, retry_after, source="handshake")
+        else:
+            LOG.error(wid, f"HTTP {e.response.status_code}", msg, e)
+            await stats.record_failure(msg)
+    except asyncio.TimeoutError:
+        # timeout 秒内没有任何事件：把所有在途按超时结算，断连重连
+        n_lost = len(sent_queue) + len(inflight)
+        LOG.error(wid, "Timeout", f"{timeout}s 无事件，{n_lost} 个在途转写按超时计")
+        for _ in range(max(1, n_lost)):
+            await stats.record_timeout(f"pipeline {timeout}s 无事件")
+    except Exception as e:
+        LOG.error(wid, "Exception", str(e), e)
+        await stats.record_connection_error(str(e))
+
+
 # ─── Worker 池 ──────────────────────────────────────────────────────────────────
 async def worker_loop(
     stats: GlobalStats, mode: str, deployment: str,
     stop_event: asyncio.Event, worker_id: int, request_interval: float = 0.0,
     transcribe_model: str = "", language: str = "",
     reuse_conn: bool = False, connect_stagger: float = 0.0,
+    pipeline: int = 1,
 ) -> None:
     # 每个 worker 是独立 task，contextvars 互不干扰
     _CTX_BATCH.set(stats.batch_index)
@@ -971,11 +1105,16 @@ async def worker_loop(
         if mode == "text":
             await run_text_session(stats, deployment, worker_id, idx)
         elif mode == "transcribe":
-            # reuse_conn: 会话内部自循环直到 stop_event；连接挂了才回到这里重连
-            await run_transcribe_session(stats, deployment, worker_id,
-                                         transcribe_model, language,
-                                         reuse=reuse_conn, stop_event=stop_event,
-                                         request_interval=request_interval)
+            # 会话内部自循环直到 stop_event；连接挂了才回到这里重连
+            if pipeline > 1:
+                await run_transcribe_pipelined(stats, deployment, worker_id,
+                                               transcribe_model, language,
+                                               pipeline=pipeline, stop_event=stop_event)
+            else:
+                await run_transcribe_session(stats, deployment, worker_id,
+                                             transcribe_model, language,
+                                             reuse=reuse_conn, stop_event=stop_event,
+                                             request_interval=request_interval)
         else:
             await run_audio_session(stats, deployment, worker_id)
         idx += 1
@@ -1019,6 +1158,7 @@ async def run_load_test(
     mode: str, deployment: str, concurrency: int, duration: float,
     request_interval: float = 0.0, transcribe_model: str = "", language: str = "",
     batch_index: int = 1, reuse_conn: bool = False, connect_stagger: float = 0.0,
+    pipeline: int = 1,
 ) -> GlobalStats:
     print(f"\n{_C['bold']}[压测]{_C['reset']} "
           f"第{batch_index}批 mode={mode} deployment={deployment} "
@@ -1027,8 +1167,8 @@ async def run_load_test(
     if mode == "transcribe":
         print(f"  transcription model: {transcribe_model}"
               f"{f'  language={language}' if language else ''}"
-              f"{'  [复用连接: 每 worker 一条 WS 循环转写]' if reuse_conn else ''}")
-        if not reuse_conn:
+              f"{f'  [管道化: 每连接 {pipeline} 在途，总在途 {concurrency * pipeline}]' if pipeline > 1 else '  [复用连接: 每 worker 一条 WS 循环转写]' if reuse_conn else ''}")
+        if not reuse_conn and pipeline <= 1:
             print(f"  {_C['yellow']}提示: 未加 --reuse-conn，每次转写都新建 realtime 会话，"
                   f"429 可能来自 realtime 部署而非转写模型{_C['reset']}")
 
@@ -1039,7 +1179,8 @@ async def run_load_test(
     workers = [
         asyncio.create_task(
             worker_loop(stats, mode, deployment, stop_event, i, request_interval,
-                        transcribe_model, language, reuse_conn, connect_stagger)
+                        transcribe_model, language, reuse_conn, connect_stagger,
+                        pipeline)
         )
         for i in range(concurrency)
     ]
@@ -1059,6 +1200,7 @@ async def run_ramp_test(
     ramp_start: int, ramp_max: int, ramp_step: int, step_duration: float,
     transcribe_model: str = "", language: str = "",
     reuse_conn: bool = False, connect_stagger: float = 0.0,
+    pipeline: int = 1,
 ) -> tuple[list[dict], GlobalStats | None]:
     print(f"\n[Ramp] {ramp_start}→{ramp_max} 并发，每步 {step_duration}s")
     results = []
@@ -1072,7 +1214,7 @@ async def run_ramp_test(
         stats = await run_load_test(mode, deployment, concurrency, step_duration,
                                     0.0, transcribe_model, language,
                                     batch_index=batch_no, reuse_conn=reuse_conn,
-                                    connect_stagger=connect_stagger)
+                                    connect_stagger=connect_stagger, pipeline=pipeline)
         last_stats = stats
         s = stats.summary()
         s["concurrency"] = concurrency
@@ -1132,6 +1274,11 @@ def parse_args() -> argparse.Namespace:
                    help="transcribe 模式复用 WS 连接：每 worker 建一次 realtime 会话，"
                         "在同一连接上循环 commit 转写。测 whisper 上限必开，否则 429 "
                         "会先撞 realtime 部署的会话创建限流")
+    p.add_argument("--pipeline", type=int, default=1,
+                   help="transcribe 模式每条连接的在途转写数(管道深度)，默认 1=串行。"
+                        ">1 时不等上一个转写完成就连发 commit(隐含复用连接)，"
+                        "总在途=并发×管道，才能真正打满转写模型配额。"
+                        "如 --concurrency 10 --pipeline 10 = 100 在途，只需 10 次握手")
     p.add_argument("--connect-stagger", type=float, default=0.25,
                    help="worker 首次握手错峰间隔(秒/个)，默认 0.25。避免一批 worker "
                         "同时握手撞 S0 tier 连接建立速率(onHandshake 429)，把连接级 "
@@ -1192,6 +1339,7 @@ def main() -> None:
                     args.transcribe_model, args.language,
                     reuse_conn=args.reuse_conn,
                     connect_stagger=args.connect_stagger,
+                    pipeline=args.pipeline,
                 )
             )
         else:
@@ -1202,6 +1350,7 @@ def main() -> None:
                     args.transcribe_model, args.language,
                     reuse_conn=args.reuse_conn,
                     connect_stagger=args.connect_stagger,
+                    pipeline=args.pipeline,
                 )
             )
             s = stats.summary()
@@ -1229,6 +1378,7 @@ def main() -> None:
                 "transcribe_model": args.transcribe_model if args.mode == "transcribe" else "",
                 "reuse_conn":      args.reuse_conn,
                 "connect_stagger": args.connect_stagger,
+                "pipeline":        args.pipeline,
                 "region":          args.region,
                 "mode":            args.mode,
                 "concurrency":     args.concurrency,
@@ -1411,7 +1561,8 @@ const metaFields = [
   ["区域",     META.region || "—"],
   ["模式",     META.mode],
   ...(META.transcribe_model ? [["转写模型", META.transcribe_model]] : []),
-  ...(META.mode === "transcribe" ? [["复用连接", META.reuse_conn ? "是" : "否(429或含握手限流)"]] : []),
+  ...(META.mode === "transcribe" ? [["复用连接", (META.pipeline>1 || META.reuse_conn) ? "是" : "否(429或含握手限流)"]] : []),
+  ...(META.pipeline > 1 ? [["管道深度", META.pipeline + "/连接 (总在途 " + (META.pipeline * META.concurrency) + ")"]] : []),
   ...(META.connect_stagger ? [["握手错峰", META.connect_stagger + "s/个"]] : []),
   ["并发",     META.concurrency],
   ["时长",     META.duration_s + "s"],

@@ -58,7 +58,10 @@ python3 realtime_loadtest.py --mode transcribe \
   --reuse-conn --concurrency 10 --duration 60 --html
 ```
 
-> **测转写模型上限必须加 `--reuse-conn`。** 转写请求必须经由 realtime 会话才到得了转写模型，两级配额是串联的：默认（不复用）每次转写都新建 realtime 会话，429 会先撞 **realtime 部署的会话创建限流**，转写模型根本没被打满。`--reuse-conn` 让每个 worker 只建一次会话，在同一条 WS 上循环 `append → commit → completed`，负载才真正落到转写模型上。429 归属看 `rate_limits.updated` 的 `name` 字段（报告里单列）。
+> **测转写模型上限必须加 `--reuse-conn`，最好再加 `--pipeline N`。** 转写请求必须经由 realtime 会话才到得了转写模型，两级配额是串联的：默认（不复用）每次转写都新建 realtime 会话，429 会先撞 **realtime 部署的会话创建限流**（S0 tier `onHandshake`），转写模型根本没被打满。
+>
+> - `--reuse-conn`（串行复用）：每 worker 一次握手，同一条 WS 循环 `append → commit → completed`。但每连接同时只有 **1 个在途转写**，吞吐被单次转写延迟（~4.5s）限死——10 并发每分钟才 ~130 次。
+> - `--pipeline N`（管道化，隐含复用）：`commit` 是异步的，**不等上一个 completed 就连发 N 个 commit**，服务端并行转写、完成事件按 `item_id` 对账（官方文档明确"完成事件顺序不保证，用 item_id 匹配"）。总在途 = 并发 × N：`--concurrency 10 --pipeline 10` = **100 个在途转写，只需 10 次握手**，这才是打满转写模型配额的压力形态。
 
 用 `session.type = "realtime"` + `output_modalities = ["text"]` 开一个**纯转写会话**，靠不发 `response.create` 来避免任何 LLM 补全，只命中 input audio transcription 模型（如 `gpt-realtime-whisper`），因此报告里的 token / RPM 全部归属转写模型本身——用来确认转写模型的配额是否被真正吃满。（`output_modalities` 不能为空数组，API 要求至少含 `text` 或 `audio`）
 
@@ -154,6 +157,7 @@ python3 realtime_loadtest.py \
 | `--transcribe-model` | `$WHISPER_DEPLOYMENT` | 转写模型部署名（仅 `transcribe` 模式） |
 | `--language` | — | 转写语言 ISO-639-1（仅 `transcribe` 模式，留空自动检测） |
 | `--reuse-conn` | 关 | `transcribe` 模式复用 WS：每 worker 一次会话内循环转写，测转写模型上限必开 |
+| `--pipeline` | `1` | 每条连接在途转写数（管道深度），>1 隐含复用连接；总在途=并发×管道 |
 | `--connect-stagger` | `0.25` | worker 首次握手错峰间隔（秒/个），防一批 worker 同时握手撞 S0 tier 连接速率（`onHandshake` 429）；设 0 关闭 |
 | `--concurrency` | `5` | 并发 WebSocket 连接数 |
 | `--duration` | `60` | 压测持续秒数 |
