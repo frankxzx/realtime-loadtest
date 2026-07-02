@@ -1,0 +1,112 @@
+# 生产 WebSocket 1006 断连：根因与最小修复方案
+
+## 结论（一句话）
+
+1006 不是 Azure 侧问题，是**客户端事件循环被强占** → keepalive `pong` 回不出去 →
+被网关按超时 `RST` 掐掉（不发 close frame，客户端记为 1006）。两处病灶都在音频处理链路：
+录音缓冲 `bytes += chunk` 的 O(n²) 复制，以及同步 ffmpeg/pydub 转码阻塞事件循环。
+
+## 症状为何对得上
+
+- **时间随机（第 5/7 分钟都有）**：由「哪次转码/复制停顿恰好撞上网关 ping 窗口」决定，
+  不是固定超时 → 看起来随机。
+- **阶段随机（正在生成 / 刚说完）**：生成时下行 delta 最猛、背压最快；刚说完是做大块
+  append/转码的时刻。两处都在制造事件循环停顿。
+- **CPU/内存监控正常**：GIL 限制单 Python 进程只吃满一个核，16 核机器总占用显示个位数
+  百分比；`bytes +=` 复制是瞬时的、旧缓冲立即释放，RSS 几乎不涨。
+  **唯一能看见它的指标是事件循环滞后（loop lag），而这个大概率没在采。**
+
+## 本地已复现（A/B 对照，见 README「本地复现 1006」）
+
+同一个 mock 网关，唯一变量是客户端有没有病灶：
+
+| | A 干净客户端 | B 带病客户端（`--sim-pcm-accumulate`） |
+|---|---|---|
+| 中途断连 | 0 | 6 次，全部 code=1006 |
+| 断连形态 | — | 同进程成簇：+52s×3 路、+79s×3 路 |
+| 事件循环滞后 | 2.7ms | 2.7s → 10.5s → 23.1s（O(n²) 正反馈滚雪球） |
+
+复现命令见 `README.md`，工具为本仓库 `realtime_loadtest.py --mode chat` + `mock_gateway.py`。
+
+---
+
+## 修复（最小改动，两处）
+
+### 修复 1：录音缓冲 `bytes +=` → `bytearray.extend()`
+
+`bytes` 不可变，每次 `+=` 整段复制整个缓冲，复杂度 O(n²)。改成 `bytearray` 原地追加即 O(1)
+均摊。实测：20MB 缓冲下第 7 分钟单次 append 从 40ms 降到 0.05ms，快约一万倍。
+
+```python
+# ── 病灶 ──
+buf = b""
+def on_pcm_chunk(chunk: bytes):
+    nonlocal buf
+    buf += chunk                    # O(n²)：每次全量复制
+
+# ── 修复 ──
+buf = bytearray()
+def on_pcm_chunk(chunk: bytes):
+    buf.extend(chunk)               # O(1) 均摊，原地追加
+# 收尾要 bytes 时再 bytes(buf)；喂 wave/ffmpeg 时 bytearray 可直接用
+```
+
+> 若同时存在「每来一个 chunk 就对全量缓冲调一次 `audioop.*`」，那是同类 O(n²) 病灶，
+> 改成收尾一次性处理，或用流式/分块处理。
+
+### 修复 2：同步转码 → 异步子进程（转码移出事件循环）
+
+`audioop`/`wave` 产不出 MP3，转码必然是 ffmpeg（可能经 pydub `.export()`）。若用
+`subprocess.run(...)` 或 pydub `.export()`（内部同步 wait 子进程），事件循环线程会
+**干等整个编码时长**——几分钟通话卡住数秒，同进程所有连接一起挨刀。ffmpeg 编码本身在
+独立进程、不占 GIL，问题只在**调用方式是同步的**。
+
+```python
+# ── 病灶（同步阻塞事件循环）──
+import subprocess
+def export_mp3(wav_path, mp3_path):
+    subprocess.run(["ffmpeg", "-y", "-i", wav_path, mp3_path], check=True)
+# 或 pydub：AudioSegment.from_wav(wav_path).export(mp3_path, format="mp3")
+
+# ── 修复（异步子进程，不阻塞 loop）──
+async def export_mp3(wav_path, mp3_path):
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", wav_path, mp3_path,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {err.decode()[:500]}")
+```
+
+- 若调用点在同步上下文里，用 `await loop.run_in_executor(None, blocking_export, ...)`
+  把它丢到线程池，同样能让出事件循环。
+- 给 ffmpeg 喂数据**用临时文件，别用 stdin 管道塞整段**（同步写大管道也会卡 loop）。
+- 转码是纯 CPU 活，量大时更稳的做法是丢给**独立 worker 进程/任务队列**，收发进程只做 IO。
+
+---
+
+## 上线前后验证
+
+1. **加 loop-lag 探针**（生产进程常驻），把告警时间戳和 1006 时间戳对表——终审证据：
+
+   ```python
+   async def loop_lag_probe(interval=1.0, warn_ms=200):
+       while True:
+           t0 = time.perf_counter()
+           await asyncio.sleep(interval)
+           lag = (time.perf_counter() - t0 - interval) * 1000
+           if lag > warn_ms:
+               logging.warning("event-loop lag %.0fms", lag)
+   ```
+
+2. **判据修正**：1006 同进程「成簇」既可能是服务端事件，也可能是客户端进程卡死。
+   用 lag 区分：**成簇 + lag 飙升 = 客户端（本案）**；成簇 + lag 正常 = 才查服务端/网关。
+
+3. **闭环回归**：修复后用本仓库 A/B 重跑，B 组从「1006 成簇 + 秒级 lag」变为「0 断连 +
+   毫秒级 lag」即确认。
+
+## 附：环境提醒
+
+- `audioop` 在 Python 3.13 已从标准库**移除**（pydub 内部也依赖它）。基础镜像升级到 3.13+
+  会直接 import 失败，重构时一并处理（3.13+ 可用 `audioop-lts` 续命）。
