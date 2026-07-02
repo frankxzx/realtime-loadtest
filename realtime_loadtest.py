@@ -18,9 +18,19 @@ Azure OpenAI Realtime API 压测脚本 (GA)
   python3 realtime_loadtest.py --mode transcribe --transcribe-model gpt-realtime-whisper \\
       --language en --burst 1000 --concurrency 10 --html
 
+  # 保险坐席场景：mock 多轮历史(坐席一轮≈1分钟话术)，AI 扮演客户回话；
+  # --sync-fire = 100 路先建连注好历史，同一时刻齐发 response.create(测同一时间戳并发)
+  python3 realtime_loadtest.py --mode chat --concurrency 100 --sync-fire --html
+
   # 带期望配额对比（拿去跟 Azure 对峙用）
   python3 realtime_loadtest.py --mode text --concurrency 20 --duration 120 \\
       --expected-tpm 50000 --expected-rpm 100 --region eastus2 --html
+
+chat 模式(保险坐席对话)关键参数:
+  --sync-fire         全员建连+注入历史后集合，同一时刻齐发一轮 response.create，
+                      打完即止(忽略 --duration)。握手仍按 --connect-stagger 错峰，
+                      保证 429 是模型配额(session)而非握手限流(handshake)
+  不加 --sync-fire    持续模式：每 worker 循环整段话本(每轮带全量历史上下文)到 duration
 
 transcribe 模式关键参数:
   --reuse-conn        复用 WS：每 worker 一次握手，同连接循环转写(串行，每连接 1 在途)
@@ -94,6 +104,155 @@ TEXT_PROMPTS = [
     "One word: hello",
     "Answer: done",
     "Respond: ack",
+]
+
+# ─── chat 模式：保险坐席场景（mock 历史 + AI 扮演客户）──────────────────────────
+# 坐席一轮 ≈ 1 分钟话术（中文口播约 270-300 字/分钟），客户简短回应。
+# 历史经 conversation.item.create 注入：坐席=user(input_text)，客户=assistant(output_text)
+# —— GA schema 已对照官方 openai SDK 类型定义核实（assistant 历史消息 content 用
+# output_text，不是 beta 时代的 text）。
+CHAT_CUSTOMER_INSTRUCTIONS = (
+    "你在一通保险销售电话里扮演客户（消费者）本人，对方是保险公司坐席。"
+    "请始终以客户身份用自然的中文口语回应：可以追问细节、讨价还价、表达犹豫或顾虑"
+    "（预算、条款、理赔、家人意见等），不要轻易答应购买，也不要跳出角色、"
+    "不要提及你是 AI。每次回复保持在两到四句话。"
+)
+
+CHAT_SCENARIOS = [
+    {
+        "name": "重疾险电销",
+        "history": [
+            ("agent",
+             "哎您好，王先生，打扰您两分钟时间。我是安康人寿的客户经理小李，咱们上个月"
+             "在您办车险的时候加过微信，当时您说对家庭保障这块有兴趣，让我这个月再跟您"
+             "联系，所以今天特意给您回个电话。是这样的，我们公司这个月刚升级了一款终身"
+             "重大疾病保险，叫安康福瑞版，保障范围从原来的一百种重疾扩展到了一百五十种，"
+             "轻症中症都能多次赔付，而且轻症赔完之后重疾保额不减，这在同类产品里是很少"
+             "见的。另外它还自带一个被保险人豁免，就是说万一在缴费期内不幸得了轻症，后"
+             "面的保费就不用再交了，合同继续有效。您看您现在方便听我大概介绍一下吗，也"
+             "就占用您几分钟时间。"),
+            ("customer",
+             "哦小李啊，我记得你。行，你简单说说吧，不过我先问一下，这种保险一年大概要"
+             "交多少钱？我怕太贵了负担不起。"),
+            ("agent",
+             "好的王先生，价格这块您放心，我给您算一下。以您现在三十五岁的年龄，如果选"
+             "五十万保额、三十年缴费期，平均下来一年大概是九千八左右，一个月也就八百多"
+             "块钱，差不多就是一家人出去吃两顿饭的钱。而且我建议您选三十年缴，虽然总保"
+             "费多一点，但是每年压力小，杠杆也高，万一出险，豁免的作用也更大。这五十万"
+             "保额是确诊即赔的，不像医疗险要先垫钱再报销，拿到手的钱您想怎么用就怎么用，"
+             "可以治病，也可以补贴家里这几年的收入损失。另外现在投保的话，我们这个月有"
+             "一个健康服务权益，送三年的门诊绿通和专家二诊，这个平时自己买也要小几千块"
+             "钱一年。"),
+            ("customer",
+             "九千八一年啊，说实话还是有点小贵。而且我有点搞不懂，我去年不是买过一个百"
+             "万医疗险嘛，一年才几百块，能报三百万，那我为什么还要再花小一万买这个五十"
+             "万的？"),
+        ],
+        "live_turns": [
+            "王先生您这个问题问得特别好，这也是我最常被问到的。医疗险和重疾险其实是完"
+            "全不同的两个东西，谁也替代不了谁。您那个百万医疗险，是报销型的，住院花了"
+            "多少，凭发票报多少，钱是给医院的；但是您想过没有，真得了大病，最大的损失"
+            "其实不是医药费，是收入。比如说不幸得个癌症，治疗加康复至少三五年不能正常"
+            "上班，房贷、车贷、孩子的学费、老人的赡养费，这些医疗险一分钱都管不了。重"
+            "疾险就是干这个的，确诊合同约定的疾病，五十万直接打到您卡上，相当于把您未"
+            "来三五年的收入提前锁定了。所以标准的配置是医疗险管医药费，重疾险管收入损"
+            "失，两个都得有，缺一个保障就是漏的。",
+            "王先生，那要不这样，您也别急着今天就定，我把刚才说的这个方案做成一个详细"
+            "的计划书，把保障责任、每年的保费、现金价值都列清楚，发到您微信上，您和嫂"
+            "子晚上一起看一看。不过有一点我得提醒您，我们这个健康权益活动是到这个月三"
+            "十号截止的，而且保费是跟着年龄走的，您过了这个生日再投保，每年就要多交三"
+            "百多块，三十年下来也是一万多块钱的差别。要是您看完计划书觉得合适，咱们这"
+            "周约个时间，我带上核保的同事上门给您做个双录，前后也就半个小时。您看是周"
+            "六上午方便还是周日下午方便？",
+        ],
+    },
+    {
+        "name": "百万医疗险续保",
+        "history": [
+            ("agent",
+             "您好，是陈女士吗？我是平惠保险的续保专员小张，工号八八零二。是这样的，您"
+             "去年七月份在我们这里投保的那份百万医疗险，下个月十五号就到期了，系统提示"
+             "您的续保通道已经开了，所以提前一个月给您打电话提醒一下。跟您同步一个好消"
+             "息，您这一年没有出险记录，续保的时候可以享受无理赔优惠，保费在去年的基础"
+             "上打九五折。另外今年这款产品升级了，外购药责任从一百种扩展到了一百五十种，"
+             "CAR-T这种上百万的治疗手段也纳入报销了，质子重离子还是百分之百报。您看趁"
+             "着这次续保，我帮您把这些新责任一起配置上好吗？"),
+            ("customer",
+             "哦对，是有这么个保险。到期了是吧？那个升级要加钱吗？加多少？"),
+            ("agent",
+             "陈女士，升级的费用其实很少。您去年的保费是六百八十六，今年九五折之后是六"
+             "百五十二，把外购药和CAR-T这两个新责任加上，一共是七百一十九，也就是比去"
+             "年多了三十几块钱。但是这三十几块钱买到的保障差别很大，现在肿瘤治疗最有效"
+             "的靶向药、免疫治疗的药，一大半都是在医院外面的药房买的，没有外购药责任的"
+             "话，这部分医疗险是不报的，自费下来一个月就是好几万。另外我看您的保单，您"
+             "先生和孩子还没有加进来，咱们这款产品是可以家庭单投保的，一张保单保全家，"
+             "三个人一起投的话整单还能再打九五折，您先生三十八岁，一年也就八百多。"),
+            ("customer",
+             "家庭单啊，那我得回去问问我们家那位。他这两年体检查出来有点脂肪肝还有结节，"
+             "这种能买吗？会不会到时候不给报？"),
+        ],
+        "live_turns": [
+            "陈女士，您问的这个正是关键。脂肪肝和结节要看具体情况，我们有智能核保，您"
+            "不用提交任何纸质材料，在线上如实回答几个问题，马上就能出结论，是标准承保、"
+            "除外承保还是加费承保，当场就知道，而且不会留任何拒保记录，对以后买别的保"
+            "险也没有影响。像轻度脂肪肝、肝功能正常的，大部分是可以标准体承保的；结节"
+            "要看是几级，一二级的甲状腺结节一般是除外甲状腺相关责任承保，其他的病还是"
+            "照样保。我的建议是趁您先生现在这些还都是小问题，赶紧把保障定下来，真等到"
+            "哪天体检结果再严重一点，想买都买不了了，医疗险的核保只会越来越严。",
+            "那这样吧陈女士，我先把您本人的续保加升级办了，保证保障不断档，这个今天电"
+            "话里就能确认，稍后我发短信给您，您点链接确认支付就可以。您先生和孩子的家"
+            "庭单，我把智能核保的链接一起发到您微信，您让先生抽五分钟把健康问卷做一下，"
+            "做完把结果截图给我，我帮您看看是什么承保结论，合适的话这个月内加进来，还"
+            "能赶上整单九五折。您放心，核保通不过是不收一分钱的，也不留记录。那我现在"
+            "就给您发短信了，您看这样安排可以吧？对了，您的微信还是尾号五六七八这个手"
+            "机号吧？",
+        ],
+    },
+    {
+        "name": "增额寿/养老年金",
+        "history": [
+            ("agent",
+             "喂，您好，李姐，我是您的保险服务人员小周啊，前两天在社区做活动的时候您在"
+             "我们展台上登记过，说想了解一下养老这块的规划。今天给您打电话，是因为我们"
+             "那款增额终身寿险月底就要停售了，想着一定得赶紧告诉您一声。这款产品简单说"
+             "就是一个安全的长期储蓄账户，保额每年按百分之三点零复利递增，写进合同里，"
+             "保证给付，不管外面利率怎么降、股市怎么跌，它都雷打不动地涨。您把闲钱放进"
+             "去，第五年之后随时可以减保取现，当孩子的教育金，或者六十岁以后当养老金按"
+             "月领，都很灵活。现在银行五年定期都降到一点五了，而且还在降，这种能锁定终"
+             "身百分之三的产品，以后真的不会再有了。"),
+            ("customer",
+             "小周啊，我想起来了。复利三个点是吧，听着是比存银行强。不过我这钱放你们保"
+             "险公司，万一你们公司倒闭了怎么办？我这养老钱可不敢有闪失。"),
+            ("agent",
+             "李姐，您这个担心特别正常，我给您讲清楚您就放心了。第一，保险公司是金融监"
+             "管总局直接监管的，偿付能力每个季度都要公开披露，我们公司目前综合偿付能力"
+             "充足率是百分之两百多，远超监管线。第二，保险法第九十二条写得明明白白，经"
+             "营人寿保险业务的公司就算破产，它的保单也必须转让给其他保险公司，转让不出"
+             "去的由监管指定接收，您的保单利益是法律兜底的。这么多年，咱们国家还没有一"
+             "张寿险保单因为公司经营问题赔不了的。第三，您这个钱写进合同的现金价值，每"
+             "一年值多少钱，合同上白纸黑字印着，不是那种看运气的分红。您要是还不放心，"
+             "我可以把条款和现金价值表都打印出来给您看。"),
+            ("customer",
+             "行吧，那你说说，我要是一年放个两万，放十年，到我六十五岁能领多少？"),
+        ],
+        "live_turns": [
+            "好嘞李姐，我拿您的情况给您算笔账啊。您今年四十八岁，每年交两万，交十年，"
+            "一共投入二十万。到您六十岁的时候，账户的现金价值大概是二十四万八；到六十"
+            "五岁，大概是二十八万七；如果一直放着不动，到八十岁能到四十四万多。领的方"
+            "式很灵活，比如您六十五岁开始，每年从里面减保领两万，一直领到八十五岁，一"
+            "共领了四十万，账户里还剩十来万可以留给孩子。而且这个账户领多少、什么时候"
+            "领，完全您说了算，急用钱的时候还可以保单贷款，最高能贷现金价值的百分之八"
+            "十，一个星期就到账，不影响合同继续增值。这笔钱进可攻退可守，您看这个数字"
+            "您还满意吧？",
+            "李姐，那我建议您这样，月底二十八号这款产品就正式停售了，现在系统里投保的"
+            "人特别多，核保还需要一两天时间，咱们别卡到最后一天。您要是基本认可这个方"
+            "案，我明天上午把计划书给您送过去，顺便帮您把投保资料先录进去，录进去不等"
+            "于生效，还有十五天的犹豫期，这十五天里您随时反悔，一分钱不少地退给您。您"
+            "就当先把这个百分之三的额度占上，免得月底想买买不到，那才是真的亏了。您明"
+            "天上午十点左右在家吧？我到时候再带一份我们公司的偿付能力报告给您，您慢慢"
+            "看。",
+        ],
+    },
 ]
 
 
@@ -825,6 +984,130 @@ async def run_text_session(
         await stats.record_connection_error(str(e))
 
 
+# ─── 同步开火（--sync-fire）────────────────────────────────────────────────────
+class SyncFire:
+    """所有 worker 建连+注入完历史后集合，同一时刻齐发 response.create。
+
+    worker 就绪调 report_ready()；没走到集合点就挂了（握手失败等）调 abandon()，
+    避免全场干等。编排侧等 all_ready（带超时兜底）后 set fire 开火。
+    """
+    def __init__(self, total: int):
+        self.total = total
+        self.ready = 0
+        self.abandoned = 0
+        self.fire = asyncio.Event()       # 开火信号
+        self.all_ready = asyncio.Event()  # 全员到齐（含中途放弃的）
+        self.fired_at_utc = ""
+
+    def report_ready(self) -> None:
+        self.ready += 1
+        self._check()
+
+    def abandon(self) -> None:
+        self.abandoned += 1
+        self._check()
+
+    def _check(self) -> None:
+        if self.ready + self.abandoned >= self.total:
+            self.all_ready.set()
+
+
+# ─── 单次会话：保险坐席多轮对话（mock 历史 + AI 扮演客户）───────────────────────
+async def run_chat_session(
+    stats: GlobalStats, deployment: str, worker_id: int,
+    timeout: float = 60.0, stop_event: asyncio.Event | None = None,
+    sync: SyncFire | None = None,
+) -> None:
+    """
+    保险坐席场景：注入 mock 聊天历史（坐席一轮 ≈ 1 分钟话术），模型扮演客户，
+    对坐席的最新话术生成回复。每个 live turn = 1 个请求（response.create）。
+    - 历史注入：坐席=user/input_text，客户=assistant/output_text（GA schema）
+    - sync 非空（--sync-fire）：注好历史后到集合点等开火信号，全场同一时刻
+      发出 response.create，只打这一轮（齐射），延迟从开火时刻起算
+    - sync 为空：live turns 逐轮打完（每轮都是完整的历史+新话术上下文），
+      会话结束后由 worker_loop 重连开新会话，直到 duration 到点
+    """
+    wid = f"W{worker_id:02d}"
+    scenario = CHAT_SCENARIOS[worker_id % len(CHAT_SCENARIOS)]
+    reported = False
+    try:
+        async with websockets.connect(
+            build_ws_url(deployment),
+            additional_headers={"api-key": API_KEY},
+            open_timeout=10, close_timeout=5, ssl=_SSL_CTX,
+        ) as ws:
+            LOG.info(wid, "connected", f"场景: {scenario['name']}")
+            await _wait_event(ws, wid, "session.created", timeout=10)
+            await _ws_send(ws, wid, {
+                "type": "session.update",
+                "session": {
+                    "type": "realtime",
+                    "output_modalities": ["text"],
+                    "instructions": CHAT_CUSTOMER_INSTRUCTIONS,
+                },
+            })
+            await _wait_event(ws, wid, "session.updated", timeout=10)
+            # 注入 mock 历史（WS 保序，服务端按序建 item，无需逐条等 created）
+            for role, text in scenario["history"]:
+                if role == "agent":
+                    item = {"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": text}]}
+                else:
+                    item = {"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}]}
+                await _ws_send(ws, wid, {"type": "conversation.item.create", "item": item})
+
+            for i, turn in enumerate(scenario["live_turns"]):
+                _CTX_SEQ.set(stats.next_seq())
+                await _ws_send(ws, wid, {
+                    "type": "conversation.item.create",
+                    "item": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": turn}]},
+                })
+                if i == 0 and sync is not None:
+                    LOG.info(wid, "ready", "历史已注入，等待同步开火")
+                    reported = True
+                    sync.report_ready()
+                    await sync.fire.wait()
+                t_turn = time.monotonic()
+                LOG.trigger(wid, "response.create", f"轮{i + 1}")
+                await _ws_send(ws, wid, {"type": "response.create"})
+                input_tok, output_tok = await _wait_response_done(
+                    ws, wid, timeout=timeout, stats=stats)
+                latency = time.monotonic() - t_turn
+                LOG.success(wid, "response.done",
+                            f"轮{i + 1} in={input_tok} out={output_tok} lat={latency:.2f}s")
+                await stats.record_success(input_tok, output_tok, latency)
+                if sync is not None:
+                    break   # 齐射模式只打同步的这一轮
+                if stop_event is not None and stop_event.is_set():
+                    break
+
+    except RateLimitError as e:
+        LOG.rate_limit(wid, f"[{e.code}] {e}")
+        await stats.record_rate_limit(str(e), e.code, e.retry_after, source="session")
+    except ResponseFailed as e:
+        LOG.error(wid, f"response.{e.status}", f"[{e.code}] {e}")
+        await stats.record_response_failure(str(e), e.code, e.status)
+    except InvalidStatus as e:
+        is_429, code, msg, retry_after = _parse_invalid_status(e)
+        if is_429:
+            LOG.rate_limit(wid, f"[握手429/连接级] [{code}] {msg} retry_after={retry_after}")
+            await stats.record_rate_limit(msg, code, retry_after, source="handshake")
+        else:
+            LOG.error(wid, f"HTTP {e.response.status_code}", msg, e)
+            await stats.record_failure(msg)
+    except asyncio.TimeoutError as e:
+        LOG.error(wid, "Timeout", str(e), e)
+        await stats.record_timeout(str(e) or "Timeout")
+    except Exception as e:
+        LOG.error(wid, "Exception", str(e), e)
+        await stats.record_connection_error(str(e))
+    finally:
+        if sync is not None and not reported:
+            sync.abandon()   # 没到集合点就挂了，别让全场干等
+
+
 # ─── 单次会话：音频 ─────────────────────────────────────────────────────────────
 async def run_audio_session(
     stats: GlobalStats, deployment: str, worker_id: int, timeout: float = 45.0,
@@ -1158,6 +1441,7 @@ async def worker_loop(
     transcribe_model: str = "", language: str = "",
     reuse_conn: bool = False, connect_stagger: float = 0.0,
     pipeline: int = 1, burst_share: int = 0,
+    sync: SyncFire | None = None,
 ) -> None:
     # 每个 worker 是独立 task，contextvars 互不干扰
     _CTX_BATCH.set(stats.batch_index)
@@ -1177,6 +1461,16 @@ async def worker_loop(
         return
     idx = worker_id
     while not stop_event.is_set():
+        if mode == "chat":
+            # 会话内部按 live turn 自行取 seq（一轮=一个请求）
+            await run_chat_session(stats, deployment, worker_id,
+                                   stop_event=stop_event, sync=sync)
+            if sync is not None:
+                return   # --sync-fire：齐射一轮即止，不重连不补发
+            idx += 1
+            if request_interval > 0:
+                await asyncio.sleep(request_interval)
+            continue
         _CTX_SEQ.set(stats.next_seq())   # 批内第几个请求（全 worker 共享递增）
         if mode == "text":
             await run_text_session(stats, deployment, worker_id, idx)
@@ -1234,13 +1528,17 @@ async def run_load_test(
     mode: str, deployment: str, concurrency: int, duration: float,
     request_interval: float = 0.0, transcribe_model: str = "", language: str = "",
     batch_index: int = 1, reuse_conn: bool = False, connect_stagger: float = 0.0,
-    pipeline: int = 1, burst: int = 0,
+    pipeline: int = 1, burst: int = 0, sync_fire: bool = False,
 ) -> GlobalStats:
     print(f"\n{_C['bold']}[压测]{_C['reset']} "
           f"第{batch_index}批 mode={mode} deployment={deployment} "
           f"concurrency={concurrency} "
-          f"{f'burst={burst}(发完即止)' if burst > 0 else f'duration={duration}s'}")
+          f"{'sync-fire(齐射一轮即止)' if sync_fire else f'burst={burst}(发完即止)' if burst > 0 else f'duration={duration}s'}")
     print(f"  endpoint: {build_ws_url(deployment)}")
+    if mode == "chat":
+        print(f"  场景: 保险坐席×AI客户，mock 历史+坐席一轮≈1分钟话术，"
+              f"{len(CHAT_SCENARIOS)} 个话本轮换"
+              f"{'  [sync-fire: 全员注好历史后同一时刻齐发]' if sync_fire else ''}")
     if mode == "transcribe":
         if burst > 0:
             print(f"  transcription model: {transcribe_model}"
@@ -1258,6 +1556,7 @@ async def run_load_test(
     stats.batch_index = batch_index
     stats.batch_concurrency = concurrency
     stop_event = asyncio.Event()
+    sync = SyncFire(concurrency) if sync_fire else None
     # burst: 把总请求数均分给各连接（前 remainder 条多 1 个）
     def _share(i: int) -> int:
         if burst <= 0:
@@ -1268,13 +1567,28 @@ async def run_load_test(
         asyncio.create_task(
             worker_loop(stats, mode, deployment, stop_event, i, request_interval,
                         transcribe_model, language, reuse_conn, connect_stagger,
-                        pipeline, _share(i))
+                        pipeline, _share(i), sync)
         )
         for i in range(concurrency)
     ]
     monitor = asyncio.create_task(monitor_loop(stats, stop_event))
 
-    if burst > 0:
+    if sync is not None:
+        # 等全员建连+注入历史（超时兜底：错峰总时长+60s），然后同一时刻开火。
+        # 之后同 burst：等所有 worker 把这一轮结算完自然结束，忽略 duration。
+        grace = connect_stagger * concurrency + 60
+        try:
+            await asyncio.wait_for(sync.all_ready.wait(), timeout=grace)
+        except asyncio.TimeoutError:
+            print(f"  {_C['yellow']}警告: 等就绪超时({grace:.0f}s)，"
+                  f"仅 {sync.ready}/{concurrency} 路就绪，直接开火{_C['reset']}")
+        sync.fired_at_utc = datetime.now(timezone.utc).isoformat()
+        print(f"\n  {_C['bold']}⚡ 同步开火: {sync.ready}/{concurrency} 路就绪 "
+              f"@ {sync.fired_at_utc}{_C['reset']}")
+        sync.fire.set()
+        await asyncio.gather(*workers, return_exceptions=True)
+        stop_event.set()
+    elif burst > 0:
         # burst 模式：发完即止，等所有 worker 把在途结算完自然结束
         await asyncio.gather(*workers, return_exceptions=True)
         stop_event.set()
@@ -1355,8 +1669,14 @@ def parse_args() -> argparse.Namespace:
         description="Azure OpenAI Realtime API 压测工具 (GA)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--mode", choices=["text", "audio", "transcribe"], default="text",
-                   help="text=文本补全  audio=语音对话  transcribe=纯转写(独立测 whisper 配额)")
+    p.add_argument("--mode", choices=["text", "audio", "transcribe", "chat"], default="text",
+                   help="text=文本补全  audio=语音对话  transcribe=纯转写(独立测 whisper 配额)  "
+                        "chat=保险坐席多轮对话(mock 历史+坐席1分钟话术，AI 扮演客户)")
+    p.add_argument("--sync-fire", action="store_true",
+                   help="仅 chat 模式：所有 worker 先建连+注入完历史（握手仍按 "
+                        "--connect-stagger 错峰），集合后同一时刻齐发 response.create，"
+                        "打完这一轮即止(忽略 --duration)。测「同一时间戳 N 个并发请求」"
+                        "打在模型配额上会怎样，如 --concurrency 100 --sync-fire")
     p.add_argument("--deployment",  default=DEPLOYMENT,
                    help="realtime 部署名(WS连接用)；transcribe 模式也连它")
     p.add_argument("--transcribe-model", default=WHISPER_DEPLOYMENT,
@@ -1423,6 +1743,12 @@ def main() -> None:
     if args.burst > 0 and args.ramp:
         print("错误: --burst 与 --ramp 不能同时使用")
         sys.exit(1)
+    if args.sync_fire and args.mode != "chat":
+        print("错误: --sync-fire 仅支持 chat 模式")
+        sys.exit(1)
+    if args.sync_fire and args.ramp:
+        print("错误: --sync-fire 与 --ramp 不能同时使用")
+        sys.exit(1)
 
     LOG = EventLog(verbose=args.verbose)
     test_start_utc = datetime.now(timezone.utc).isoformat()
@@ -1456,6 +1782,7 @@ def main() -> None:
                     connect_stagger=args.connect_stagger,
                     pipeline=args.pipeline,
                     burst=args.burst,
+                    sync_fire=args.sync_fire,
                 )
             )
             s = stats.summary()
@@ -1485,6 +1812,7 @@ def main() -> None:
                 "connect_stagger": args.connect_stagger,
                 "pipeline":        args.pipeline,
                 "burst":           args.burst,
+                "sync_fire":       args.sync_fire,
                 "region":          args.region,
                 "mode":            args.mode,
                 "concurrency":     args.concurrency,
