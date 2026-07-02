@@ -1132,8 +1132,13 @@ async def run_transcribe_pipelined(
         for _ in range(max(1, n_lost)):
             await stats.record_timeout(f"pipeline {timeout}s 无事件")
     except Exception as e:
-        LOG.error(wid, "Exception", str(e), e)
+        # 连接中断（如服务端 1007 断连）：在途请求已发出未结算，必须按失败计，
+        # 否则 burst 总数对不上、成功率虚高
+        n_lost = len(sent_queue) + len(inflight)
+        LOG.error(wid, "Exception", f"{e}  ({n_lost} 个在途按连接错误计)", e)
         await stats.record_connection_error(str(e))
+        for _ in range(n_lost):
+            await stats.record_failure(f"连接中断，在途转写丢失: {str(e)[:80]}")
 
 
 # ─── Worker 池 ──────────────────────────────────────────────────────────────────
