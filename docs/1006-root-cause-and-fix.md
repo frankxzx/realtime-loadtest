@@ -34,6 +34,15 @@
 
 ### 修复 0：两行止血补丁（侵入最小，先上这个）
 
+> **生产实况更正（已核对实际代码）**：收集侧是 `b64decode(delta)` → `list.append`
+> 且每轮重置——**无累积病灶，修复①不适用，可跳过**。真实病灶在轮末：
+> `asyncio.create_task(handle_*_audio_convert_upload(...))` —— **create_task 不会把
+> 工作挪出事件循环**，若该函数内部转码是同步的（subprocess.run / pydub.export /
+> wave+audioop），数秒硬阻塞照样落在 loop 上。**只需修复②**，两种形态
+> （3 行手术级 / 整体替换级）见 [`examples/fix_convert_upload.py`](../examples/fix_convert_upload.py)，
+> 已验证 100 路并发转码期间事件循环最大滞后 72ms。
+> 以下 ①①-A/①-B 仅当代码里另有 `+=` 累积时才需要。
+
 两个病灶各改一处、共约四行、零结构改动，1006 的机制链两个源头即断。
 注意**只改其一不够**：只改 extend 治不了轮末同步转码那次 3-5 秒硬阻塞
 （恰恰最匹配「刚说完就断」的生产观察）；只改转码治不了 O(n²) 慢性累积
