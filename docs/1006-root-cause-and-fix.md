@@ -32,23 +32,34 @@
 
 ## 修复（最小改动，两处）
 
-### 修复 1：录音缓冲 `bytes +=` → `bytearray.extend()`
+### 修复 1：别把整通电话的音频攒内存 → 流式写盘 + 轮末转码
 
-`bytes` 不可变，每次 `+=` 整段复制整个缓冲，复杂度 O(n²)。改成 `bytearray` 原地追加即 O(1)
-均摊。实测：20MB 缓冲下第 7 分钟单次 append 从 40ms 降到 0.05ms，快约一万倍。
+根子上的问题不是「`+=` 用错类型」，是**整通电话的音频不该攒在内存里**。
+
+**注意 base64 陷阱**：Realtime WS 里音频是 base64 字符串。`str` 和 `bytes` 都不可变，
+`+=` 拼接一律 O(n²)，base64 救不了（还大 33%）。CPython 对「**局部变量 + str**」的 `+=`
+有个原地 realloc 特判会让它变快，但**换成 `bytes`、或存到 `self.buf` 属性、或全局变量，
+优化立刻失效跌回 O(n²)**——而生产音频缓冲几乎必然是 `self.buf`（属性）或已解码的 PCM
+`bytes`，两者都在悬崖下面。实测（累积 7 分钟音频）：
+
+| 累积写法 | 7 分钟耗时 | 复杂度 |
+|---|---|---|
+| 局部 `s += b64`（str，踩中 CPython 特判） | 20ms | O(n) |
+| 局部 `b += pcm`（bytes） | 8.9 秒 | O(n²) |
+| 属性 `self.buf += b64`（str） | 10.7 秒 | O(n²) |
+| **流式写盘 + `list`/文件**（修复） | ~90ms，内存恒定 | O(n) |
+
+**正确姿势**：每个音频 delta 到达 → base64 解码一次 → 流式写入本轮 `.pcm` 文件（内存恒定、
+无不可变拼接）；一轮 QA 结束后异步转 MP3（见修复 2）。参考实现见
+[`examples/turn_audio_recorder.py`](../examples/turn_audio_recorder.py)（`start/feed/finish`
+三调用即可贴进现有 WS 循环，自带自测；已验证 feed 峰值内存 KB 级、100 路并发转码不死锁）。
 
 ```python
-# ── 病灶 ──
-buf = b""
-def on_pcm_chunk(chunk: bytes):
-    nonlocal buf
-    buf += chunk                    # O(n²)：每次全量复制
-
-# ── 修复 ──
-buf = bytearray()
-def on_pcm_chunk(chunk: bytes):
-    buf.extend(chunk)               # O(1) 均摊，原地追加
-# 收尾要 bytes 时再 bytes(buf)；喂 wave/ffmpeg 时 bytearray 可直接用
+# 极简版（不落盘、内存内一轮）：list 攒 chunk，收尾 join 一次，同样 O(n) 且不踩 CPython 陷阱
+self.chunks = []
+def on_delta(delta_b64: str):
+    self.chunks.append(base64.b64decode(delta_b64))   # O(1) 追加
+pcm = b"".join(self.chunks)                           # 收尾一次，O(n)
 ```
 
 > 若同时存在「每来一个 chunk 就对全量缓冲调一次 `audioop.*`」，那是同类 O(n²) 病灶，
