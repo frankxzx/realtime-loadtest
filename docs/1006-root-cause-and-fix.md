@@ -40,10 +40,18 @@
 （10 分钟以上长通话单独致死）。
 
 ```python
-# ① 治 O(n²)：只改初始化这一行，下面的 self.buf += chunk 一个字不用动
-self.buf = b""                 # ← 病灶
-self.buf = bytearray()         # ← bytearray += bytes 原地扩容，均摊 O(1)
-# 注意：grep 有无别处把它重置回 b""；严格要 bytes 的下游包一层 bytes(self.buf)
+# ① 治 O(n²)。生产实际累积的是 base64 字符串（self.buf += delta_b64，str 挂属性，
+#    实测 7 分钟 10.7s，O(n²)）。两个版本任选：
+
+# ①-A 语义零变化版（3 行）：join 与重复 += 产出逐字节相同
+self.chunks = []                                  # 原 self.buf = ""
+self.chunks.append(delta_b64)                     # 原 self.buf += delta_b64
+pcm = base64.b64decode("".join(self.chunks))      # 原 b64decode(self.buf)
+
+# ①-B 推荐版（2 改 1 删）：逐 chunk 独立解码进 bytearray，顺手排掉填充哑弹
+self.buf = bytearray()
+self.buf.extend(base64.b64decode(delta_b64))      # 每 delta 本就是独立完整 base64
+# 收尾的 base64.b64decode(self.buf) 整行删掉，直接用 self.buf 喂后面
 
 # ② 治转码阻塞：原同步转码函数一个字不改，挪进线程池
 self._export_mp3(wav_path, mp3_path)                       # ← 病灶（卡 loop 数秒）
@@ -51,6 +59,11 @@ await asyncio.get_running_loop().run_in_executor(
     None, self._export_mp3, wav_path, mp3_path)            # ← 线程等 ffmpeg，GIL 释放
 # 默认线程池 ~32 工位，100 路同时收尾自然排队 = 免费限流
 ```
+
+> **base64 拼接解码的哑弹（实测确认）**：带 `=` 填充的 chunk 拼接后整体
+> `b64decode`，会在第一个 `=` 处**静默截断丢数据、不报错**。现在没炸只是因为
+> Realtime 音频 delta 的字节数恰好是 3 的倍数（无中间填充）——这不是 API 契约。
+> ①-B 逐 chunk 解码天然免疫；①-A 保留此隐性假设，故推荐 ①-B。
 
 实测收益：①把 7 分钟通话的累积停顿从 ~10.7s 压到 ~1ms；②把轮末 N 秒硬阻塞
 从事件循环上清零。上线后用 loop-lag 探针 + 1006 率验证（见下文）。
