@@ -1119,12 +1119,12 @@ async def run_chat_session(
                 t_turn = time.monotonic()
                 LOG.trigger(wid, "response.create", f"轮{i + 1}")
                 await _ws_send(ws, wid, {"type": "response.create"})
-                input_tok, output_tok = await _wait_response_done(
+                input_tok, output_tok, usage_d = await _wait_response_done(
                     ws, wid, timeout=timeout, stats=stats)
                 latency = time.monotonic() - t_turn
                 LOG.success(wid, "response.done",
-                            f"轮{i + 1} in={input_tok} out={output_tok} lat={latency:.2f}s")
-                await stats.record_success(input_tok, output_tok, latency)
+                            f"轮{i + 1} {_usage_brief(input_tok, output_tok, usage_d)} lat={latency:.2f}s")
+                await stats.record_success(input_tok, output_tok, latency, usage_details=usage_d)
                 if sync is not None:
                     break   # 齐射模式只打同步的这一轮
                 if stop_event is not None and stop_event.is_set():
