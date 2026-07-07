@@ -425,6 +425,14 @@ class GlobalStats:
     total_tokens:      int   = 0
     # whisper 家族按音频时长计费(usage.type=="duration"，无 token)，累计转写秒数
     transcribed_seconds: float = 0.0
+    # usage 明细累计(官方 usage.input_token_details/output_token_details，
+    # cached 是 input 的子集；键名对齐 GA schema，见 _extract_usage_details)
+    usage_details: dict = field(default_factory=lambda: {
+        "input_text_tokens": 0, "input_audio_tokens": 0, "input_image_tokens": 0,
+        "input_cached_tokens": 0,
+        "cached_text_tokens": 0, "cached_audio_tokens": 0, "cached_image_tokens": 0,
+        "output_text_tokens": 0, "output_audio_tokens": 0,
+    })
 
     req_timestamps:   deque = field(default_factory=deque)
     token_timestamps: deque = field(default_factory=deque)
@@ -470,7 +478,7 @@ class GlobalStats:
               f"[{kind}] @ +{elapsed:.1f}s  {detail[:80]}\n")
 
     async def record_success(self, input_tok: int, output_tok: int, latency: float,
-                             audio_seconds: float = 0.0):
+                             audio_seconds: float = 0.0, usage_details: dict | None = None):
         async with self.lock:
             now = time.monotonic()
             self.total_requests += 1
@@ -479,6 +487,10 @@ class GlobalStats:
             self.output_tokens += output_tok
             self.total_tokens  += input_tok + output_tok
             self.transcribed_seconds += audio_seconds
+            if usage_details:
+                for k, v in usage_details.items():
+                    if v and k in self.usage_details:
+                        self.usage_details[k] += v
             self.latencies.append(latency)
             self.req_timestamps.append(now)
             for _ in range(input_tok + output_tok):
@@ -658,6 +670,7 @@ class GlobalStats:
             "input_tokens":       self.input_tokens,
             "output_tokens":      self.output_tokens,
             "total_tokens":       self.total_tokens,
+            "usage_details":      dict(self.usage_details),
             "transcribed_audio_s": round(self.transcribed_seconds, 1),
             "avg_audio_s_per_min": round(self.transcribed_seconds / elapsed * 60, 1) if elapsed > 0 else 0,
             "avg_rpm":            round(self.success / elapsed * 60, 1) if elapsed > 0 else 0,
@@ -794,7 +807,7 @@ def _handle_transcription_failed(worker: str, evt: dict, fatal: bool):
     LOG.warn(worker, "transcription.failed(非致命)", f"[{code}] {msg}")
 
 
-async def _wait_response_done(ws, worker: str, timeout: float, stats=None) -> tuple[int, int]:
+async def _wait_response_done(ws, worker: str, timeout: float, stats=None) -> tuple[int, int, dict]:
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -823,7 +836,8 @@ async def _wait_response_done(ws, worker: str, timeout: float, stats=None) -> tu
                 # 非致命：hit max_tokens/被打断，仍拿到部分 token，计成功但告警
                 sd = resp.get("status_details", {}) or {}
                 LOG.warn(worker, f"response.{status}", json.dumps(sd)[:120])
-            return usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+            return (usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                    _extract_usage_details(usage))
         if t == "rate_limits.updated":
             await _capture_rate_limits(stats, worker, evt)
         if t == "conversation.item.input_audio_transcription.failed":
@@ -835,8 +849,41 @@ async def _wait_response_done(ws, worker: str, timeout: float, stats=None) -> tu
 _USAGE_MISSING_WARNED = False   # usage 真缺失只警告一次，别刷屏
 
 
-def _parse_transcription_usage(worker: str, evt: dict) -> tuple[int, int, float, str]:
-    """从 transcription.completed 事件解析 (in_tok, out_tok, audio_seconds, transcript)。
+def _extract_usage_details(usage: dict) -> dict:
+    """usage.input_token_details/output_token_details → 扁平明细，键名对齐 GA schema。
+    cached 是 input 的子集(input_tokens 已含 cached)；转写 tokens 形态只有
+    input 的 text/audio；whisper duration 形态无 token，全 0。"""
+    ind  = usage.get("input_token_details", {}) or {}
+    outd = usage.get("output_token_details", {}) or {}
+    cad  = ind.get("cached_tokens_details", {}) or {}
+    return {
+        "input_text_tokens":   ind.get("text_tokens", 0) or 0,
+        "input_audio_tokens":  ind.get("audio_tokens", 0) or 0,
+        "input_image_tokens":  ind.get("image_tokens", 0) or 0,
+        "input_cached_tokens": ind.get("cached_tokens", 0) or 0,
+        "cached_text_tokens":  cad.get("text_tokens", 0) or 0,
+        "cached_audio_tokens": cad.get("audio_tokens", 0) or 0,
+        "cached_image_tokens": cad.get("image_tokens", 0) or 0,
+        "output_text_tokens":  outd.get("text_tokens", 0) or 0,
+        "output_audio_tokens": outd.get("audio_tokens", 0) or 0,
+    }
+
+
+def _usage_brief(in_tok: int, out_tok: int, d: dict) -> str:
+    """日志用 usage 摘要：in=25(text12+audio13,cached4) out=30(text30)，只列非零项"""
+    def _parts(*pairs) -> str:
+        return "+".join(f"{name}{n}" for name, n in pairs if n)
+    inp = _parts(("text", d["input_text_tokens"]), ("audio", d["input_audio_tokens"]),
+                 ("image", d["input_image_tokens"]))
+    if d["input_cached_tokens"]:
+        inp = f"{inp},cached{d['input_cached_tokens']}" if inp else f"cached{d['input_cached_tokens']}"
+    outp = _parts(("text", d["output_text_tokens"]), ("audio", d["output_audio_tokens"]))
+    return (f"in={in_tok}" + (f"({inp})" if inp else "")
+            + f" out={out_tok}" + (f"({outp})" if outp else ""))
+
+
+def _parse_transcription_usage(worker: str, evt: dict) -> tuple[int, int, float, str, dict]:
+    """从 transcription.completed 事件解析 (in_tok, out_tok, audio_seconds, transcript, usage明细)。
 
     usage 有两种官方形态：
     - tokens:   {input_tokens, output_tokens, input_token_details...}（gpt-4o-transcribe 系）
@@ -848,7 +895,7 @@ def _parse_transcription_usage(worker: str, evt: dict) -> tuple[int, int, float,
     transcript = evt.get("transcript", "")
     # whisper 家族：按时长计费，正常形态
     if usage.get("type") == "duration":
-        return 0, 0, float(usage.get("seconds") or 0.0), transcript
+        return 0, 0, float(usage.get("seconds") or 0.0), transcript, _extract_usage_details({})
     details = usage.get("input_token_details", {}) or {}
     in_tok  = usage.get("input_tokens", 0)
     out_tok = usage.get("output_tokens", 0)
@@ -863,13 +910,13 @@ def _parse_transcription_usage(worker: str, evt: dict) -> tuple[int, int, float,
         _USAGE_MISSING_WARNED = True
         LOG.warn(worker, "transcription usage 缺失(仅提示一次)",
                  json.dumps({k: v for k, v in evt.items() if k != "logprobs"})[:300])
-    return in_tok, out_tok, 0.0, transcript
+    return in_tok, out_tok, 0.0, transcript, _extract_usage_details(usage)
 
 
 async def _wait_transcription_completed(ws, worker: str, timeout: float,
-                                        stats=None) -> tuple[int, int, float, str]:
+                                        stats=None) -> tuple[int, int, float, str, dict]:
     """等待 conversation.item.input_audio_transcription.completed，
-    返回 (in_tok, out_tok, audio_seconds, transcript)"""
+    返回 (in_tok, out_tok, audio_seconds, transcript, usage明细)"""
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -956,11 +1003,11 @@ async def run_text_session(
                 },
             })
             await _ws_send(ws, wid, {"type": "response.create"})
-            input_tok, output_tok = await _wait_response_done(ws, wid, timeout=timeout, stats=stats)
+            input_tok, output_tok, usage_d = await _wait_response_done(ws, wid, timeout=timeout, stats=stats)
             latency = time.monotonic() - t_start
             LOG.success(wid, "response.done",
-                        f"in={input_tok} out={output_tok} lat={latency:.2f}s")
-            await stats.record_success(input_tok, output_tok, latency)
+                        f"{_usage_brief(input_tok, output_tok, usage_d)} lat={latency:.2f}s")
+            await stats.record_success(input_tok, output_tok, latency, usage_details=usage_d)
 
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
@@ -1152,11 +1199,11 @@ async def run_audio_session(
             await _wait_event(ws, wid, "session.updated", timeout=10)
             await _ws_send(ws, wid, {"type": "input_audio_buffer.append", "audio": TEST_AUDIO_B64})
             await _ws_send(ws, wid, {"type": "response.create"})
-            input_tok, output_tok = await _wait_response_done(ws, wid, timeout=timeout, stats=stats)
+            input_tok, output_tok, usage_d = await _wait_response_done(ws, wid, timeout=timeout, stats=stats)
             latency = time.monotonic() - t_start
             LOG.success(wid, "response.done",
-                        f"in={input_tok} out={output_tok} lat={latency:.2f}s")
-            await stats.record_success(input_tok, output_tok, latency)
+                        f"{_usage_brief(input_tok, output_tok, usage_d)} lat={latency:.2f}s")
+            await stats.record_success(input_tok, output_tok, latency, usage_details=usage_d)
 
     except RateLimitError as e:
         LOG.rate_limit(wid, f"[{e.code}] {e}")
@@ -1239,15 +1286,15 @@ async def run_transcribe_session(
                                              "audio": TEST_AUDIO_B64})
                     await _ws_send(ws, wid, {"type": "input_audio_buffer.commit"})
                     LOG.trigger(wid, "commit(trigger)")
-                    input_tok, output_tok, audio_s, transcript = await _wait_transcription_completed(
+                    input_tok, output_tok, audio_s, transcript, usage_d = await _wait_transcription_completed(
                         ws, wid, timeout=timeout, stats=stats)
                     latency = time.monotonic() - t_req
                     usage_s = (f"dur={audio_s:.2f}s" if audio_s
-                               else f"in={input_tok} out={output_tok}")
+                               else _usage_brief(input_tok, output_tok, usage_d))
                     LOG.success(wid, "transcription.completed",
                                 f'{usage_s} sent@+{t_req - _T0:.1f}s lat={latency:.2f}s "{transcript[:30]}"')
                     await stats.record_success(input_tok, output_tok, latency,
-                                               audio_seconds=audio_s)
+                                               audio_seconds=audio_s, usage_details=usage_d)
                 except RateLimitError as e:
                     # 转写级限流（transcription.failed / error 事件）：会话还活着，
                     # 复用模式下记录后继续压——这正是我们要测的 whisper 429
@@ -1383,13 +1430,13 @@ async def run_transcribe_pipelined(
                     seq, t_sent = _settle(evt.get("item_id", ""))
                     _CTX_SEQ.set(seq)
                     latency = time.monotonic() - t_sent
-                    in_tok, out_tok, audio_s, transcript = _parse_transcription_usage(wid, evt)
-                    usage_s = f"dur={audio_s:.2f}s" if audio_s else f"in={in_tok} out={out_tok}"
+                    in_tok, out_tok, audio_s, transcript, usage_d = _parse_transcription_usage(wid, evt)
+                    usage_s = f"dur={audio_s:.2f}s" if audio_s else _usage_brief(in_tok, out_tok, usage_d)
                     LOG.success(wid, "transcription.completed",
                                 f'{usage_s} sent@+{t_sent - _T0:.1f}s lat={latency:.2f}s '
                                 f'inflight={len(inflight)+len(sent_queue)} "{transcript[:30]}"')
                     await stats.record_success(in_tok, out_tok, latency,
-                                               audio_seconds=audio_s)
+                                               audio_seconds=audio_s, usage_details=usage_d)
                 elif t == "conversation.item.input_audio_transcription.failed":
                     seq, _ = _settle((evt.get("item_id") or ""))
                     _CTX_SEQ.set(seq)
@@ -1858,8 +1905,8 @@ h2{font-size:14px;color:#8b949e;margin-bottom:10px;font-weight:normal;text-trans
 .card.warn .value{color:#d29922}
 .card.danger .value{color:#f85149}
 .card.good .value{color:#56d364}
-/* ── 异常分类 chips ── */
-#anom-chips{display:flex;flex-wrap:wrap;gap:10px}
+/* ── 异常分类 / token 明细 chips ── */
+#anom-chips,#usage-chips{display:flex;flex-wrap:wrap;gap:10px}
 .chip{background:#161b22;border:1px solid #30363d;border-radius:20px;padding:6px 14px;
   display:flex;gap:8px;align-items:center}
 .chip .n{font-size:16px;font-weight:bold}
@@ -1917,6 +1964,11 @@ td.evt{width:220px;white-space:nowrap}
 <div class="section" id="anom-section">
   <h2>异常分类</h2>
   <div id="anom-chips"></div>
+</div>
+
+<div class="section" id="usage-section" style="display:none">
+  <h2>Token 消耗明细 (usage.input/output_token_details)</h2>
+  <div id="usage-chips"></div>
 </div>
 
 <div class="section" id="declared-section" style="display:none">
@@ -2081,6 +2133,28 @@ document.getElementById("anom-chips").innerHTML = chips.map(c =>
 if (anomTotal === 0)
   document.getElementById("anom-chips").innerHTML =
     '<div class="chip zero"><span class="lbl">全程无异常 ✓</span></div>';
+
+// ── Token 消耗明细 (cached 是 input 的子集，不重复计入总数) ────────────────────
+const UD = SUM.usage_details || {};
+const udItems = [
+  ["输入·文本",     UD.input_text_tokens,   "#79c0ff"],
+  ["输入·音频",     UD.input_audio_tokens,  "#79c0ff"],
+  ["输入·图像",     UD.input_image_tokens,  "#79c0ff"],
+  ["输入·缓存命中", UD.input_cached_tokens, "#56d364"],
+  ["缓存·文本",     UD.cached_text_tokens,  "#56d364"],
+  ["缓存·音频",     UD.cached_audio_tokens, "#56d364"],
+  ["缓存·图像",     UD.cached_image_tokens, "#56d364"],
+  ["输出·文本",     UD.output_text_tokens,  "#d2a8ff"],
+  ["输出·音频",     UD.output_audio_tokens, "#d2a8ff"],
+].filter(([,n]) => n > 0);
+if (udItems.length) {
+  document.getElementById("usage-section").style.display = "";
+  document.getElementById("usage-chips").innerHTML = udItems.map(([lbl,n,color]) =>
+    `<div class="chip">
+       <span class="n" style="color:${color}">${n.toLocaleString()}</span>
+       <span class="lbl">${lbl}</span>
+     </div>`).join("");
+}
 
 // ── Azure 上报配额 (rate_limits.updated) ──────────────────────────────────────
 const RLR      = META.rate_limit_reports || [];
