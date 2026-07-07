@@ -46,8 +46,9 @@ export function attachRealtimeMonitor(channel, handlers = {}, opts = {}) {
 
   const emit = (name, payload) => {
     const cb = "on" + name.replace(/(^|_)(\w)/g, (_, __, c) => c.toUpperCase());
-    handlers.onAny?.(name, payload);
-    handlers[cb]?.(payload);
+    // 回调异常不外冒：既不影响业务监听器，也不污染全局 onerror/错误上报
+    try { handlers.onAny?.(name, payload); } catch (e) { console.error("[realtime-monitor] onAny 回调异常:", e); }
+    try { handlers[cb]?.(payload); } catch (e) { console.error(`[realtime-monitor] ${cb} 回调异常:`, e); }
   };
 
   const onOpen = () => { opened = true; };
