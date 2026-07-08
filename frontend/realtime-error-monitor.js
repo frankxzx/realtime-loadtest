@@ -13,11 +13,17 @@
  * 另有配额遥测：`rate_limits.updated` → onRateLimits（remaining 触底≈即将 429）
  *
  * 浏览器限制（重要）：WS 握手被 HTTP 429/401 拒绝时，浏览器只给 close(1006)，
- * 看不到状态码——这类统一归到 onConnectFailed，由服务端代理层负责区分。
+ * 看不到状态码。若经过 backend/realtime_proxy.py 代理，握手层的 HTTP 状态码会被
+ * 翻译成自定义 close code（4429/4401/...），本监听器识别后把握手 429 直接并入
+ * onRateLimit（source="handshake"）——业务侧零改动即可同时感知会话内/握手两种 429。
+ * 未走代理时（浏览器直连），握手失败一律归到 onConnectFailed。
  */
 
 /** 与压测脚本 _is_rate_limit 同款宽匹配；原始 message 始终在 payload.raw 里保留 */
 const RATE_LIMIT_RE = /rate.?limit|too.?many.?requests|quota|exceeded|429/i;
+
+/** backend/realtime_proxy.py 用来转达握手层 HTTP 状态码的自定义 close code 约定 */
+const PROXY_CLOSE_CODES = { 4429: "rate_limit", 4401: "auth", 4400: "bad_request", 4502: "upstream" };
 
 export function isRateLimitError(code, message) {
   return RATE_LIMIT_RE.test(String(code || "")) || RATE_LIMIT_RE.test(String(message || ""));
@@ -26,21 +32,23 @@ export function isRateLimitError(code, message) {
 /**
  * @param {WebSocket|RTCDataChannel} channel 已创建的连接（任意 readyState 均可）
  * @param {object} handlers 全部可选：
- *   onRateLimit({source, code, message, raw})      限流（source: error|response|transcription）
+ *   onRateLimit({source, code, message, retryAfter?, raw})  限流（source: error|response|transcription|handshake）
+ *                                                  handshake 来自代理翻译的 4429，带 retryAfter(秒)
  *   onApiError({type, code, message, param, raw})  顶层 error 事件（非限流）
  *   onResponseFailed({code, type, raw})            response.done failed（非限流）
  *   onResponseIncomplete({reason, raw})            截断：max_output_tokens | content_filter
  *   onResponseCancelled({reason, raw})             取消：turn_detected | client_cancelled（VAD 下属正常）
  *   onTranscriptionFailed({itemId, code, message, raw}) 转写失败（非限流）
  *   onRateLimits({limits, low, raw})               rate_limits.updated；low=remaining/limit<lowWatermark 的项
- *   onConnectFailed({closeCode, reason})           握手失败（浏览器看不到 HTTP 状态码，429/401 均在此）
+ *   onConnectFailed({closeCode, reason, kind})     握手失败；kind 来自代理约定(auth/bad_request/upstream/unknown)
  *   onAbnormalClose({closeCode, reason})           建连成功后的非 1000 断开
  *   onAny(type, payload)                           以上所有事件的总线（type 为回调名去掉 on 的小写蛇形）
- * @param {object} opts { lowWatermark = 0.1 } 配额剩余低水位告警阈值
+ * @param {object} opts { lowWatermark = 0.1, proxyCloseCodes } 低水位阈值 / 覆盖代理 close code 映射
  * @returns {() => void} detach 函数
  */
 export function attachRealtimeMonitor(channel, handlers = {}, opts = {}) {
   const lowWatermark = opts.lowWatermark ?? 0.1;
+  const proxyCloseCodes = opts.proxyCloseCodes ?? PROXY_CLOSE_CODES;
   let opened = channel.readyState === 1; // WebSocket.OPEN 与 RTCDataChannel "open" 均为 1/"open"
   if (typeof channel.readyState === "string") opened = channel.readyState === "open";
 
@@ -104,9 +112,22 @@ export function attachRealtimeMonitor(channel, handlers = {}, opts = {}) {
   };
 
   const onClose = (e) => {
-    const info = { closeCode: e.code ?? null, reason: e.reason || "" };
-    if (!opened) emit("connect_failed", info);        // 握手即挂：HTTP 429/401/5xx 在浏览器全长这样
-    else if (e.code !== 1000) emit("abnormal_close", info);
+    const code = e.code ?? null;
+    const reason = e.reason || "";
+    const mapped = proxyCloseCodes[code];
+    // 代理翻译的握手 429 → 直接并入限流通道（source=handshake），业务侧零改动即可感知
+    if (mapped === "rate_limit") {
+      const s = reason.trim();
+      const retryAfter = /^\d+$/.test(s) ? Number(s) : null;
+      emit("rate_limit", {
+        source: "handshake", code: "rate_limit_exceeded",
+        message: retryAfter != null ? `握手被限流(连接级)，Retry-After=${retryAfter}s` : "握手被限流(连接级)",
+        retryAfter, raw: e,
+      });
+      return;
+    }
+    if (!opened) emit("connect_failed", { closeCode: code, reason, kind: mapped || "unknown" });
+    else if (code !== 1000) emit("abnormal_close", { closeCode: code, reason });
   };
 
   const onError = () => { /* 浏览器 error 事件无信息量，紧随的 close 才有 code，这里不上报 */ };

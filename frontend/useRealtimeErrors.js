@@ -15,8 +15,8 @@ export function useRealtimeErrors(options = {}) {
 
   const state = reactive({
     connected: false,          // 是否成功建连过（握手失败时保持 false）
-    rateLimited: 0,            // 累计限流次数（三种 source 合并）
-    lastRateLimit: null,       // {source, code, message, at}
+    rateLimited: 0,            // 累计限流次数（error/response/transcription/handshake 四种 source 合并）
+    lastRateLimit: null,       // {source, code, message, retryAfter?, at}
     lastError: null,           // 最近一条非限流异常 {kind, code, message, at}
     quota: {},                 // name -> {limit, remaining, resetSeconds}（rate_limits.updated）
     quotaLow: false,           // 任一配额 remaining 低于水位线
